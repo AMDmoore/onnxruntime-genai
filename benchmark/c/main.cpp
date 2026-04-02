@@ -309,7 +309,18 @@ int main(int argc, char** argv) {
   OgaHandle handle;
   try {
     const auto opts = benchmark::ParseOptionsFromCommandLine(argc, argv);
+
+    if (!opts.ep_library_name.empty()) {
+      OgaRegisterExecutionProviderLibrary(opts.ep_library_name.c_str(),
+                                          opts.ep_library_path.c_str());
+    }
+
     RunBenchmark(opts);
+
+    if (!opts.ep_library_name.empty()) {
+      OgaUnregisterExecutionProviderLibrary(opts.ep_library_name.c_str());
+    }
+
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Exception: " << e.what() << "\n";

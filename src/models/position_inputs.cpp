@@ -397,10 +397,31 @@ void DefaultPositionInputs::RewindMask(size_t index) {
   }
 }
 
+void DefaultPositionInputs::RewindStaticMaskAfterPadding(int real_length, int padded_length) {
+  if (!has_mask_input_ || !ShouldUseStaticMaskHandling())
+    return;
+  if (real_length >= padded_length)
+    return;
+
+  auto mask_span = attention_mask_->GetByteSpan();
+  auto cpu = mask_span.CopyDeviceToCpu();
+
+  if (type_ == Ort::TypeToTensorType<int32_t>) {
+    auto* data = reinterpret_cast<int32_t*>(cpu.data());
+    std::fill(data + real_length, data + padded_length, int32_t{0});
+  } else {
+    auto* data = reinterpret_cast<int64_t*>(cpu.data());
+    std::fill(data + real_length, data + padded_length, int64_t{0});
+  }
+
+  mask_span.CopyCpuToDevice();
+}
+
 bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
   return state_.params_->use_graph_capture ||
          (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
-          model_.p_device_->GetType() == DeviceType::NvTensorRtRtx);
+          (model_.p_device_->GetType() == DeviceType::NvTensorRtRtx ||
+           model_.p_device_->GetType() == DeviceType::CPU));
 }
 
 // TODO: SlidingWindow does not support graph capture

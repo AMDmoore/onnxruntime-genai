@@ -7,6 +7,7 @@ struct PositionInputs {
   virtual void Add() = 0;
   virtual void Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) = 0;
   virtual void RewindTo(size_t index) = 0;
+  virtual void RewindStaticMaskAfterPadding(int real_length, int padded_length) {}
 };
 
 struct DefaultPositionInputs : PositionInputs {
@@ -16,6 +17,7 @@ struct DefaultPositionInputs : PositionInputs {
   void Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) override;
 
   void RewindTo(size_t index) override;
+  void RewindStaticMaskAfterPadding(int real_length, int padded_length) override;
 
  private:
   void AddAttentionMask();
