@@ -31,14 +31,16 @@ void CXX_API(
     const std::string& model_path,
     const std::string& ep,
     const std::string& ep_path,
+    const std::string& ep_name,
     const std::string& system_prompt,
     const std::string& user_prompt,
     bool verbose,
     bool debug,
     bool interactive,
-    bool rewind) {
+    bool rewind,
+    int max_new_tokens) {
   if (debug) SetLogger();
-  RegisterEP(ep, ep_path);
+  if (!ep_name.empty()) RegisterEP(ep_name, ep_path);
 
   if (verbose) std::cout << "Creating config..." << std::endl;
   std::unordered_map<std::string, std::string> ep_options;
@@ -158,8 +160,12 @@ void CXX_API(
     std::cout << std::endl;
     std::cout << "Output: ";
     const int current_token_count = generator->TokenCount();
+    int generated_count = 0;
     try {
       while (!generator->IsDone()) {
+        if (max_new_tokens > 0 && generated_count >= max_new_tokens) {
+          break;
+        }
         generator->GenerateNextToken();
 
         if (is_first_token) {
@@ -169,6 +175,7 @@ void CXX_API(
 
         const auto new_token = generator->GetNextTokens()[0];
         std::cout << stream->Decode(new_token) << std::flush;
+        generated_count++;
       }
     } catch (const std::exception& e) {
       std::cout << "\n"
@@ -193,11 +200,12 @@ int main(int argc, char** argv) {
   // Get command-line args
   GeneratorParamsArgs generator_params_args;
   GuidanceArgs guidance_args;
-  std::string model_path, ep = "follow_config", ep_path = "", system_prompt = "You are a helpful AI assistant.", user_prompt = "What color is the sky?";
+  std::string model_path, ep = "follow_config", ep_path = "", ep_name = "", system_prompt = "You are a helpful AI assistant.", user_prompt = "What color is the sky?";
   bool verbose = false, debug = false, interactive = true, rewind = false;
+  int max_new_tokens = 0;
   std::vector<std::string> image_paths;
   std::vector<std::string> audio_paths;
-  if (!ParseArgs(argc, argv, generator_params_args, guidance_args, model_path, ep, ep_path, system_prompt, user_prompt, verbose, debug, interactive, rewind, image_paths, audio_paths)) {
+  if (!ParseArgs(argc, argv, generator_params_args, guidance_args, model_path, ep, ep_path, ep_name, system_prompt, user_prompt, verbose, debug, interactive, rewind, image_paths, audio_paths, max_new_tokens)) {
     return -1;
   }
 
@@ -217,11 +225,12 @@ int main(int argc, char** argv) {
   std::cout << "Debug: " << debug << std::endl;
   std::cout << "Interactive: " << interactive << std::endl;
   std::cout << "Rewind: " << rewind << std::endl;
+  if (max_new_tokens > 0) std::cout << "Max new tokens per prompt: " << max_new_tokens << std::endl;
   std::cout << "--------------------------" << std::endl;
   std::cout << std::endl;
 
   try {
-    CXX_API(generator_params_args, guidance_args, model_path, ep, ep_path, system_prompt, user_prompt, verbose, debug, interactive, rewind);
+    CXX_API(generator_params_args, guidance_args, model_path, ep, ep_path, ep_name, system_prompt, user_prompt, verbose, debug, interactive, rewind, max_new_tokens);
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return -1;

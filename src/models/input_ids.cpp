@@ -73,7 +73,11 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
     sequence_length = static_cast<size_t>(new_tokens.size()) / state_.params_->search.batch_size;
 
   const int fixed_prompt_length = model_.config_->model.decoder.fixed_prompt_length;
-  const bool should_pad = is_prompt_ && fixed_prompt_length > 0 &&
+  // Pad any multi-token input shorter than fixed_prompt_length.
+  // This covers both the initial prompt and subsequent AppendTokenSequences calls
+  // in continuous decoding (e.g., model_chat appends system prompt then user prompt).
+  const bool should_pad = fixed_prompt_length > 0 &&
+                           sequence_length > 1 &&
                            static_cast<int>(sequence_length) < fixed_prompt_length;
 
   if (should_pad) {

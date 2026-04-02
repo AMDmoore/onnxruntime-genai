@@ -390,8 +390,8 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
   }
 
   const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
-  if (first_run_ && fixed_len > 0 && total_length < fixed_len) {
-    position_inputs_->RewindStaticMaskAfterPadding(total_length, fixed_len);
+  if (first_run_ && fixed_len > 0 && total_length < padded_total_) {
+    position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
   }
 
   first_run_ = false;
@@ -419,10 +419,18 @@ void DecoderOnlyPipelineState::UpdateKeyValueCache(DeviceSpan<int32_t> beam_indi
 
 void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens,
                                                    DeviceSpan<int32_t> beam_indices, int total_length) {
+  const int actual_new = static_cast<int>(next_tokens.size());
   input_ids_->Update(next_tokens);
   size_t new_length = input_ids_->GetShape()[1];
+
+  // For static-shape models with fixed_prompt_length padding, translate total_length
+  // into the padded coordinate system so that UpdateAttentionMaskStatic and
+  // UpdatePositionIds compute correct offsets (past_real + padded_new_length).
+  // For decode (actual_new == new_length == 1) this reduces to total_length unchanged.
+  padded_total_ = (total_length - actual_new) + static_cast<int>(new_length);
+
   auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
-  position_inputs_->Update(padded_tokens, total_length, static_cast<int>(new_length));
+  position_inputs_->Update(padded_tokens, padded_total_, static_cast<int>(new_length));
   UpdateKeyValueCache(beam_indices, total_length);
   if (recurrent_state_) {
     recurrent_state_->Update();
