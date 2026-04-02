@@ -355,7 +355,8 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
 
   // first_run_ should be thought of as prompt_processing_run_.
   // It is true only for the prompt processing part when the provided tokens are more than 1.
-  first_run_ = next_tokens.size() > 1;
+  // Use padded shape (from input_ids_) to account for fixed_prompt_length padding.
+  first_run_ = static_cast<size_t>(input_ids_->GetShape()[1]) > 1;
   size_t num_chunks{1};
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value()) {
     int window_size = model_.config_->model.decoder.sliding_window->window_size;
@@ -388,6 +389,11 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
     }
   }
 
+  const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
+  if (first_run_ && fixed_len > 0 && total_length < fixed_len) {
+    position_inputs_->RewindStaticMaskAfterPadding(total_length, fixed_len);
+  }
+
   first_run_ = false;
 
   return logits_.Get();
@@ -415,14 +421,14 @@ void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tok
                                                    DeviceSpan<int32_t> beam_indices, int total_length) {
   input_ids_->Update(next_tokens);
   size_t new_length = input_ids_->GetShape()[1];
-  position_inputs_->Update(next_tokens, total_length, static_cast<int>(new_length));
+  auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
+  position_inputs_->Update(padded_tokens, total_length, static_cast<int>(new_length));
   UpdateKeyValueCache(beam_indices, total_length);
   if (recurrent_state_) {
     recurrent_state_->Update();
   }
 
-  auto next_windowed_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
-  logits_.Update(next_windowed_tokens, new_length);
+  logits_.Update(padded_tokens, new_length);
 }
 
 OrtValue* DecoderOnlyPipelineState::GetOutput(const char* name) {
