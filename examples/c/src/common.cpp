@@ -167,8 +167,8 @@ bool ParseArgs(
     GuidanceArgs& guidance_args,
     std::string& model_path,
     std::string& ep,
-    std::string& ep_path,
     std::string& ep_name,
+    std::string& ep_library_path,
     std::string& system_prompt,
     std::string& user_prompt,
     bool& verbose,
@@ -208,8 +208,8 @@ bool ParseArgs(
   app.add_flag("-v,--verbose", verbose, "Print verbose output and timing information. Defaults to false");
   app.add_flag("-d,--debug", debug, "Dump input and output tensors with debug mode. Defaults to false");
 
-  app.add_option("--ep_path", ep_path, "Path to execution provider DLL/SO for plug-in providers (ex: onnxruntime_providers_cuda.dll or onnxruntime_providers_tensorrt.dll)");
-  app.add_option("--ep_name", ep_name, "EP registration name for plug-in providers (e.g., MorphiZenEP). Used with --ep_path for DLL registration without overriding genai_config.json.");
+  std::vector<std::string> ep_library;
+  app.add_option("--ep_library", ep_library, "Register a plug-in execution provider: <name> <dll_path> (e.g., MorphiZenEP onnxruntime_morphizen_ep.dll)")->expected(2);
   app.add_option("--system_prompt", system_prompt, "System prompt to use for the model.");
   app.add_option("--user_prompt", user_prompt, "User prompt to use for the model.");
   app.add_flag("--rewind", rewind, "Rewind to the system prompt after each generation. Defaults to false. Only used in model_chat.");
@@ -226,6 +226,12 @@ bool ParseArgs(
     std::cout << app.help() << std::endl;
     return false;
   }
+
+  if (ep_library.size() == 2) {
+    ep_name = ep_library[0];
+    ep_library_path = ep_library[1];
+  }
+
   return true;
 }
 

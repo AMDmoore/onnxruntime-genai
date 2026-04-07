@@ -238,7 +238,7 @@ struct GuidanceArgs {
  *
  * @return true if command-line arguments can be parsed, else false
  */
-bool ParseArgs(int argc, char** argv, GeneratorParamsArgs& generator_params_args, GuidanceArgs& guidance_args, std::string& model_path, std::string& ep, std::string& ep_path, std::string& ep_name, std::string& system_prompt, std::string& user_prompt, bool& verbose, bool& debug, bool& interactive, bool& rewind, std::vector<std::string>& image_paths, std::vector<std::string>& audio_paths, int& max_new_tokens);
+bool ParseArgs(int argc, char** argv, GeneratorParamsArgs& generator_params_args, GuidanceArgs& guidance_args, std::string& model_path, std::string& ep, std::string& ep_name, std::string& ep_library_path, std::string& system_prompt, std::string& user_prompt, bool& verbose, bool& debug, bool& interactive, bool& rewind, std::vector<std::string>& image_paths, std::vector<std::string>& audio_paths, int& max_new_tokens);
 
 /**
  * @brief Set log options inside ORT GenAI
