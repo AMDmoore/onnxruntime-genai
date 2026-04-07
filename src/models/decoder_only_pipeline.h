@@ -106,6 +106,7 @@ struct DecoderOnlyPipelineState : State {
 
   std::unique_ptr<RecurrentState> recurrent_state_;
   std::unique_ptr<PositionInputs> position_inputs_;
+  int padded_total_{};  // total_length in padded coordinate system for static-shape models
   ExtraInputs extra_inputs_{*this};
 };
 
