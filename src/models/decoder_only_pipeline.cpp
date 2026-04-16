@@ -430,7 +430,18 @@ void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tok
   padded_total_ = (total_length - actual_new) + static_cast<int>(new_length);
 
   auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
-  position_inputs_->Update(padded_tokens, padded_total_, static_cast<int>(new_length));
+
+  // WindowedPositionInputs needs the original (un-windowed) token span to calculate
+  // the correct number of windows. padded_tokens is already windowed by WindowedInputIDs
+  // (e.g. 128 tokens), so num_windows_ would be 1 instead of the actual chunk count.
+  const bool slide_inputs = model_.config_->model.decoder.sliding_window.has_value() &&
+                            model_.config_->model.decoder.sliding_window->slide_inputs;
+  if (slide_inputs && actual_new > 1) {
+    position_inputs_->Update(next_tokens, padded_total_, static_cast<int>(new_length));
+  } else {
+    position_inputs_->Update(padded_tokens, padded_total_, static_cast<int>(new_length));
+  }
+
   UpdateKeyValueCache(beam_indices, total_length);
   if (recurrent_state_) {
     recurrent_state_->Update();
