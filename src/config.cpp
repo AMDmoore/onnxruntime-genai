@@ -592,8 +592,6 @@ struct Decoder_Element : JSON::Element {
       v_.num_key_value_heads = static_cast<int>(JSON::Get<double>(value));
     } else if (name == "head_size") {
       v_.head_size = static_cast<int>(JSON::Get<double>(value));
-    } else if (name == "fixed_prompt_length") {
-      v_.fixed_prompt_length = static_cast<int>(JSON::Get<double>(value));
     } else {
       throw JSON::unknown_value_error{};
     }

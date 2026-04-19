@@ -7,6 +7,8 @@ struct PositionInputs {
   virtual void Add() = 0;
   virtual void Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) = 0;
   virtual void RewindTo(size_t index) = 0;
+  // Default no-op; overridden by WindowedPositionInputs to clear trailing pad
+  // positions in the last prefill chunk's mask window after chunked prefill.
   virtual void RewindStaticMaskAfterPadding(int real_length, int padded_length) {}
 };
 
@@ -17,7 +19,6 @@ struct DefaultPositionInputs : PositionInputs {
   void Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) override;
 
   void RewindTo(size_t index) override;
-  void RewindStaticMaskAfterPadding(int real_length, int padded_length) override;
 
  private:
   void AddAttentionMask();
@@ -43,7 +44,8 @@ struct DefaultPositionInputs : PositionInputs {
   // This returns true when either:
   // 1. Graph capture is enabled, OR
   // 2. Past-present buffer sharing is enabled AND the device is NvTensorRtRtx
-  // Both scenarios require static mask allocation and special shape handling for optimization
+  // Both scenarios require static mask allocation and special shape handling for
+  // optimization.
   bool ShouldUseStaticMaskHandling() const;
 
   const Model& model_;
@@ -88,6 +90,10 @@ struct WindowedPositionInputs : PositionInputs {
     throw std::runtime_error("WindowedPositionInputs does not support RewindTo.");
   };
 
+  // After all prefill chunks have been processed, clear any pad positions in the
+  // last chunk's mask window so that downstream decode sees mask sum == real_length.
+  void RewindStaticMaskAfterPadding(int real_length, int padded_length) override;
+
  private:
   State& state_;
   const Model& model_{state_.model_};
@@ -102,6 +108,10 @@ struct WindowedPositionInputs : PositionInputs {
   ONNXTensorElementDataType attention_mask_type_{};
   std::unique_ptr<OrtValue> attention_mask_;
   size_t attention_mask_backward_offset_{~0U};
+  // Mask offset of the start of the last (most recently processed) prefill chunk's window.
+  size_t last_chunk_mask_start_{~0U};
+  // Number of next_tokens entries belonging to the last chunk that were pad tokens.
+  size_t last_chunk_pad_count_{0};
 
   size_t attention_mask_index_{~0U};
   size_t position_ids_index_{~0U};

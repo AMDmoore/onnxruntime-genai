@@ -397,31 +397,10 @@ void DefaultPositionInputs::RewindMask(size_t index) {
   }
 }
 
-void DefaultPositionInputs::RewindStaticMaskAfterPadding(int real_length, int padded_length) {
-  if (!has_mask_input_ || !ShouldUseStaticMaskHandling())
-    return;
-  if (real_length >= padded_length)
-    return;
-
-  auto mask_span = attention_mask_->GetByteSpan();
-  auto cpu = mask_span.CopyDeviceToCpu();
-
-  if (type_ == Ort::TypeToTensorType<int32_t>) {
-    auto* data = reinterpret_cast<int32_t*>(cpu.data());
-    std::fill(data + real_length, data + padded_length, int32_t{0});
-  } else {
-    auto* data = reinterpret_cast<int64_t*>(cpu.data());
-    std::fill(data + real_length, data + padded_length, int64_t{0});
-  }
-
-  mask_span.CopyCpuToDevice();
-}
-
 bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
   return state_.params_->use_graph_capture ||
          (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
-          (model_.p_device_->GetType() == DeviceType::NvTensorRtRtx ||
-           model_.p_device_->GetType() == DeviceType::CPU));
+          model_.p_device_->GetType() == DeviceType::NvTensorRtRtx);
 }
 
 namespace {
@@ -497,9 +476,41 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
     return;
   }
 
-  if (window_index_ == 0) {
+  // Helper: count pad tokens in a slice of next_tokens.
+  auto count_pads_in_chunk = [&](size_t chunk_index) -> size_t {
+    const auto pad_id = model_.config_->model.pad_token_id;
+    const auto& span = next_tokens.CpuSpan();
+    const size_t start = chunk_index * window_size_;
+    if (start >= span.size()) return 0;
+    const size_t end = std::min(start + window_size_, span.size());
+    size_t count = 0;
+    for (size_t i = start; i < end; ++i) {
+      if (span[i] == pad_id) ++count;
+    }
+    // Treat any tokens missing past the end of next_tokens as pads as well.
+    count += (start + window_size_) - end;
+    return count;
+  };
+
+  // Mirror WindowedInputIDs::Update's branching: the prefill-init branch must
+  // require next_tokens.size() > 1 in addition to window_index_ == 0. Otherwise
+  // a single-token decode call -- which always lands here with
+  // window_index_ == 0 once we've reset between prompts -- would be
+  // misinterpreted as the start of a new prefill batch and produce
+  // [1, window_size] position_ids when the decode session expects [1, 1].
+  // (Known limitation, shared with WindowedInputIDs: a 1-token prompt cannot
+  // be distinguished from a 1-token decode by shape alone and will be routed
+  // to the else "all chunks done" branch.)
+  if (next_tokens.size() > 1 && window_index_ == 0) {
     num_windows_ = (next_tokens.size() + window_size_ - 1) / window_size_;
     if (has_posid_input_) {
+      // Restore window-shaped tensor in case a prior decode step shrank
+      // position_ids_shape_ to [1, 1] (see the "all chunks done" branch below).
+      // Without this, a subsequent prompt processing call (e.g. continuous
+      // decoding via a second AppendTokens) would create a [1, 1] position_ids
+      // here and feed it to the prefill model -- which expects [1, window_size]
+      // -- producing "Got: 1 Expected: <window_size>" at session.Run.
+      position_ids_shape_[1] = window_size_;
       position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
 
       WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
@@ -517,20 +528,19 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
     if (has_mask_input_) {
       attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
 
+      // Fill the entire chunk-0 window with 1s (treating pads as real for the
+      // duration of prefill). This mirrors DefaultPositionInputs behavior so
+      // GroupQueryAttention sees a non-negative past_sequence_length during
+      // chunked prefill. The pad positions are cleared later via
+      // RewindStaticMaskAfterPadding once all prefill chunks are processed.
       WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
         using T = std::remove_pointer_t<decltype(attention_mask_data)>;
         std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, T{0});
-        for (size_t i = 0; i < window_size_; i++) {
-          attention_mask_data[attention_mask_shape_[1] - window_size_ + i] =
-              next_tokens.CpuSpan()[i] == model_.config_->model.pad_token_id ? T{0} : T{1};
-        }
-        for (size_t i = 0; i < window_size_; i++) {
-          if (attention_mask_data[attention_mask_shape_[1] - window_size_ + i] == T{1}) {
-            attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ + i - 1;
-            break;
-          }
-        }
+        std::fill_n(attention_mask_data + attention_mask_shape_[1] - window_size_, window_size_, T{1});
       });
+      attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ - 1;
+      last_chunk_mask_start_ = attention_mask_shape_[1] - window_size_;
+      last_chunk_pad_count_ = count_pads_in_chunk(0);
     }
   } else if (window_index_ < num_windows_) {
     if (has_posid_input_) {
@@ -545,6 +555,8 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
         using T = std::remove_pointer_t<decltype(attention_mask_data)>;
         std::fill_n(attention_mask_data + attention_mask_backward_offset_ - window_size_ + 1, window_size_, T{1});
       });
+      last_chunk_mask_start_ = attention_mask_backward_offset_ - window_size_ + 1;
+      last_chunk_pad_count_ = count_pads_in_chunk(window_index_);
       attention_mask_backward_offset_ -= window_size_;
     }
   } else {
@@ -565,6 +577,19 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
       WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
         using T = std::remove_pointer_t<decltype(attention_mask_data)>;
         attention_mask_data[attention_mask_backward_offset_] = T{1};
+
+        if (std::getenv("ORTGENAI_WIN_REWIND_DEBUG")) {
+          int64_t sum = 0;
+          for (int64_t i = 0; i < attention_mask_shape_[1]; i++)
+            sum += static_cast<int64_t>(attention_mask_data[i]);
+          static int dbg_count = 0;
+          if (dbg_count < 5) {
+            fprintf(stderr,
+                    "[WIN_DECODE] step=%d backward_offset=%zu mask_sum=%lld (pre-decrement)\n",
+                    dbg_count, attention_mask_backward_offset_, (long long)sum);
+            dbg_count++;
+          }
+        }
       });
       if (attention_mask_backward_offset_ > 0) {
         attention_mask_backward_offset_ -= 1;
@@ -581,6 +606,56 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
   }
 
   window_index_++;
+
+  // Symmetric to WindowedInputIDs::Update: reset chunk counters once we've
+  // dispatched the final prefill window. This lets a subsequent decode call
+  // route through the "all chunks done" else branch above, and -- combined
+  // with the position_ids_shape_[1] restoration at the top of the
+  // window_index_ == 0 branch -- lets a subsequent prompt-processing call
+  // (continuous decoding) re-enter chunked prefill cleanly.
+  if (window_index_ == num_windows_) {
+    window_index_ = 0;
+    num_windows_ = 0;
+  }
+}
+
+void WindowedPositionInputs::RewindStaticMaskAfterPadding(int real_length, int padded_length) {
+  // Called once after the final prefill chunk has been dispatched. We pre-filled
+  // each chunk's window with all 1s so that GroupQueryAttention sees correct
+  // past_sequence_length / total_sequence_length values per chunk; now we need
+  // to clear the trailing pad positions in the LAST chunk's window so that
+  // ReduceSum(attention_mask) - 1 reports (real_length - 1) at decode time.
+  (void)real_length;
+  (void)padded_length;
+
+  if (!has_mask_input_) return;
+  if (last_chunk_pad_count_ == 0) return;
+  if (last_chunk_mask_start_ == ~0U) return;
+  if (last_chunk_pad_count_ > window_size_) return;
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    const size_t clear_start = last_chunk_mask_start_ + (window_size_ - last_chunk_pad_count_);
+    std::fill_n(attention_mask_data + clear_start, last_chunk_pad_count_, T{0});
+
+    if (std::getenv("ORTGENAI_WIN_REWIND_DEBUG")) {
+      // Print mask sum after rewind (only int32 path for brevity).
+      int64_t sum = 0;
+      for (int64_t i = 0; i < attention_mask_shape_[1]; i++) {
+        sum += static_cast<int64_t>(attention_mask_data[i]);
+      }
+      fprintf(stderr,
+              "[WIN_REWIND] cleared %zu pads at [%zu..%zu) of last chunk window starting %zu; "
+              "real_length=%d padded=%d mask_sum=%lld backward_offset=%zu\n",
+              last_chunk_pad_count_, clear_start, clear_start + last_chunk_pad_count_,
+              last_chunk_mask_start_, real_length, padded_length, (long long)sum,
+              attention_mask_backward_offset_);
+    }
+  });
+
+  // Subsequent decode steps walk leftward from attention_mask_backward_offset_,
+  // so no offset adjustment is needed here.
+  last_chunk_pad_count_ = 0;
 }
 
 // Qwen2VLPositionInputs implementation

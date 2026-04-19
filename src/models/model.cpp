@@ -3,7 +3,10 @@
 //
 // Modifications Copyright(C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 #include <algorithm>
+#include <chrono>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <set>
 #include <string>
@@ -154,8 +157,18 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
     run_options_->AddConfigEntry("disable_synchronize_execution_providers", "1");
   }
 
+  static const bool chunk_timing = std::getenv("ORTGENAI_CHUNK_TIMING") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
+
   session.Run(run_options_.get(), input_names_.data(), inputs_.data(), input_names_.size(),
               output_names_.data(), outputs_.data(), output_names_.size());
+
+  if (chunk_timing) {
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr, "[CHUNK_TIMING]       session.Run: %.1fms (inputs=%zu, outputs=%zu)\n",
+            ms, input_names_.size(), output_names_.size());
+  }
 
   extra_outputs_.RegisterOutputs();
 

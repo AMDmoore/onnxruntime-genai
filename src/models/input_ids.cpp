@@ -72,18 +72,6 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   if (is_prompt_ && state_.params_->search.num_beams > 1)
     sequence_length = static_cast<size_t>(new_tokens.size()) / state_.params_->search.batch_size;
 
-  const int fixed_prompt_length = model_.config_->model.decoder.fixed_prompt_length;
-  // Pad any multi-token input shorter than fixed_prompt_length.
-  // This covers both the initial prompt and subsequent AppendTokenSequences calls
-  // in continuous decoding (e.g., model_chat appends system prompt then user prompt).
-  const bool should_pad = fixed_prompt_length > 0 &&
-                           sequence_length > 1 &&
-                           static_cast<int>(sequence_length) < fixed_prompt_length;
-
-  if (should_pad) {
-    sequence_length = static_cast<size_t>(fixed_prompt_length);
-  }
-
   if (static_cast<size_t>(shape_[1]) != sequence_length) {
     shape_[1] = sequence_length;
     value_->CreateTensor(shape_, state_.params_->use_graph_capture && shape_[1] == 1);
@@ -93,13 +81,7 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   // Update input_ids with next tokens
   auto data_span = value_->GetDeviceSpan<int32_t>();
 
-  if (should_pad) {
-    auto cpu_span = data_span.CpuSpan();
-    auto src = new_tokens.CopyDeviceToCpu();
-    std::copy(src.begin(), src.end(), cpu_span.begin());
-    std::fill(cpu_span.begin() + src.size(), cpu_span.end(), model_.config_->model.pad_token_id);
-    data_span.CopyCpuToDevice();
-  } else if (is_prompt_ && state_.params_->search.num_beams > 1) {
+  if (is_prompt_ && state_.params_->search.num_beams > 1) {
     // For beam search
     int row_size = static_cast<int>(shape_[1]);
     for (int b = 0; b < shape_[0]; b++) {
