@@ -119,6 +119,14 @@ struct WindowedPositionInputs : PositionInputs {
   size_t window_size_{};
   size_t num_windows_{};
   size_t window_index_{};
+
+  // Total number of real (non-pad) prompt+generated tokens accumulated across
+  // all prefill chunks and decode steps. Used to compute the next decode
+  // position_id correctly under alignment="left" (where the last buffer entry
+  // can be a pad with position_id 0) and under multi-chunk prefill where the
+  // intermediate-branch iota assigns increasing positions to trailing pads.
+  // In both cases data[last] is unsuitable as a "max real position" source.
+  size_t historical_num_tokens_{0};
 };
 // Qwen2-VL uses 3D rotary position embeddings (mrope) for multimodal (vision + text) content.
 // Position IDs have shape [3, batch_size, seq_len] where the 3 dimensions represent:
