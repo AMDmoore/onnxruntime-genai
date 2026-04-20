@@ -161,14 +161,9 @@ void CXX_API(
     std::cout << "Output: ";
     const int current_token_count = generator->TokenCount();
     int generated_count = 0;
-    const bool diag = (getenv("MODEL_CHAT_DIAG") != nullptr);
-    if (diag)
-      fprintf(stderr, "[CHAT_DIAG] Before loop: IsDone=%d, TokenCount=%d, current_token_count=%d, prompt_tokens_length=%d\n",
-              (int)generator->IsDone(), (int)generator->TokenCount(), current_token_count, prompt_tokens_length);
     try {
       while (!generator->IsDone()) {
         if (max_new_tokens > 0 && generated_count >= max_new_tokens) {
-          if (diag) fprintf(stderr, "[CHAT_DIAG] Reached max_new_tokens=%d, breaking\n", max_new_tokens);
           break;
         }
         generator->GenerateNextToken();
@@ -179,14 +174,9 @@ void CXX_API(
         }
 
         const auto new_token = generator->GetNextTokens()[0];
-        if (diag)
-          fprintf(stderr, "[CHAT_DIAG] gen[%d] token_id=%d\n", generated_count, (int)new_token);
         std::cout << stream->Decode(new_token) << std::flush;
         generated_count++;
       }
-      if (diag)
-        fprintf(stderr, "[CHAT_DIAG] After loop: generated_count=%d, IsDone=%d\n",
-                generated_count, (int)generator->IsDone());
     } catch (const std::exception& e) {
       std::cout << "\n"
                 << "Terminating generation: " << e.what() << std::endl;

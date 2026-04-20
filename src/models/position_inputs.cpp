@@ -651,19 +651,6 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
       WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
         using T = std::remove_pointer_t<decltype(attention_mask_data)>;
         attention_mask_data[attention_mask_backward_offset_] = T{1};
-
-        if (std::getenv("ORTGENAI_WIN_REWIND_DEBUG")) {
-          int64_t sum = 0;
-          for (int64_t i = 0; i < attention_mask_shape_[1]; i++)
-            sum += static_cast<int64_t>(attention_mask_data[i]);
-          static int dbg_count = 0;
-          if (dbg_count < 5) {
-            fprintf(stderr,
-                    "[WIN_DECODE] step=%d backward_offset=%zu mask_sum=%lld (pre-decrement)\n",
-                    dbg_count, attention_mask_backward_offset_, (long long)sum);
-            dbg_count++;
-          }
-        }
       });
       if (attention_mask_backward_offset_ > 0) {
         attention_mask_backward_offset_ -= 1;
@@ -711,20 +698,6 @@ void WindowedPositionInputs::RewindStaticMaskAfterPadding(int real_length, int p
     using T = std::remove_pointer_t<decltype(attention_mask_data)>;
     const size_t clear_start = last_chunk_mask_start_ + (window_size_ - last_chunk_pad_count_);
     std::fill_n(attention_mask_data + clear_start, last_chunk_pad_count_, T{0});
-
-    if (std::getenv("ORTGENAI_WIN_REWIND_DEBUG")) {
-      // Print mask sum after rewind (only int32 path for brevity).
-      int64_t sum = 0;
-      for (int64_t i = 0; i < attention_mask_shape_[1]; i++) {
-        sum += static_cast<int64_t>(attention_mask_data[i]);
-      }
-      fprintf(stderr,
-              "[WIN_REWIND] cleared %zu pads at [%zu..%zu) of last chunk window starting %zu; "
-              "real_length=%d padded=%d mask_sum=%lld backward_offset=%zu\n",
-              last_chunk_pad_count_, clear_start, clear_start + last_chunk_pad_count_,
-              last_chunk_mask_start_, real_length, padded_length, (long long)sum,
-              attention_mask_backward_offset_);
-    }
   });
 
   // Subsequent decode steps walk leftward from attention_mask_backward_offset_,

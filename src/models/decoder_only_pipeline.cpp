@@ -7,10 +7,6 @@
 #include "decoder_only_pipeline.h"
 #include "windowed_kv_cache.h"
 
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-
 namespace Generators {
 
 DecoderOnlyPipelineModel::DecoderOnlyPipelineModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
@@ -205,8 +201,6 @@ void DecoderOnlyPipelineState::SetExtraInputs(const std::vector<ExtraInput>& ext
 
 void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>& next_tokens,
                                            DeviceSpan<int32_t> next_indices, bool is_last_chunk) {
-  static const bool chunk_timing = std::getenv("ORTGENAI_CHUNK_TIMING") != nullptr;
-
   for (auto& pipeline_state : pipeline_states_) {
     if (first_run_ && !model_.config_->model.decoder.pipeline[pipeline_state->id_].run_on_prompt) {
       continue;
@@ -215,8 +209,6 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
     } else if (!first_run_ && !model_.config_->model.decoder.pipeline[pipeline_state->id_].run_on_token_gen) {
       continue;
     }
-
-    auto t_stage_start = std::chrono::steady_clock::now();
 
     DurationTrace trace{MakeString("DecoderOnlyPipelineState::RunPipeline[", pipeline_state->id_, "]")};
 
@@ -323,12 +315,8 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
       }
     }
 
-    auto t_before_run = std::chrono::steady_clock::now();
-
     // Run the intermediate pipeline state
     pipeline_state->Run(total_length, next_tokens, next_indices);
-
-    auto t_after_run = std::chrono::steady_clock::now();
 
     // If there is any partial KV cache update to start, enqueue it.
     if (partial_kv_cache_update_record) {
@@ -356,24 +344,12 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
         }
       }
     }
-
-    if (chunk_timing && first_run_) {
-      auto t_stage_end = std::chrono::steady_clock::now();
-      double io_bind_ms = std::chrono::duration<double, std::milli>(t_before_run - t_stage_start).count();
-      double run_ms = std::chrono::duration<double, std::milli>(t_after_run - t_before_run).count();
-      double post_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_after_run).count();
-      const auto& model_id = model_.config_->model.decoder.pipeline[pipeline_state->id_].model_id;
-      fprintf(stderr, "[CHUNK_TIMING]     stage[%s] io_bind: %.1fms | session.Run: %.1fms | post: %.1fms\n",
-              model_id.c_str(), io_bind_ms, run_ms, post_ms);
-    }
   }
 }
 
 DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int32_t>& next_tokens,
                                                 DeviceSpan<int32_t> next_indices) {
   DurationTrace trace{"DecoderOnlyPipelineState::Run"};
-
-  static const bool chunk_timing = std::getenv("ORTGENAI_CHUNK_TIMING") != nullptr;
 
   UpdateInputsOutputs(next_tokens, next_indices, total_length);
 
@@ -383,24 +359,13 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
   // window_size > 1 even on the last chunk.
   first_run_ = static_cast<size_t>(input_ids_->GetShape()[1]) > 1;
   size_t num_chunks{1};
-  int window_size = 0;
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value()) {
-    window_size = model_.config_->model.decoder.sliding_window->window_size;
+    const int window_size = model_.config_->model.decoder.sliding_window->window_size;
     num_chunks = (next_tokens.size() + window_size - 1) / window_size;
   }
 
-  auto t_run_start = std::chrono::steady_clock::now();
-  if (chunk_timing && num_chunks > 1) {
-    fprintf(stderr, "[CHUNK_TIMING] Run: num_chunks=%zu, prompt_tokens=%zu, window_size=%d\n",
-            num_chunks, next_tokens.size(), window_size);
-  }
-
   for (size_t i = 0; i < num_chunks; ++i) {
-    auto t_chunk_start = std::chrono::steady_clock::now();
-
     RunPipeline(total_length, next_tokens, next_indices, (i == num_chunks - 1));
-
-    auto t_pipeline_done = std::chrono::steady_clock::now();
 
     if (model_.config_->model.decoder.sliding_window.has_value() && i < num_chunks - 1) {
       // Sliding the window over the input_ids, key_cache, and value_cache, position_ids, and attention_mask
@@ -410,20 +375,6 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
       logits_.Update(WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get()),
                      static_cast<int>(input_ids_->GetShape()[1]));
     }
-
-    if (chunk_timing && num_chunks > 1) {
-      auto t_update_done = std::chrono::steady_clock::now();
-      double pipeline_ms = std::chrono::duration<double, std::milli>(t_pipeline_done - t_chunk_start).count();
-      double update_ms = std::chrono::duration<double, std::milli>(t_update_done - t_pipeline_done).count();
-      fprintf(stderr, "[CHUNK_TIMING]   chunk[%zu/%zu] pipeline: %.1fms | updates: %.1fms\n",
-              i, num_chunks, pipeline_ms, update_ms);
-    }
-  }
-
-  if (chunk_timing && num_chunks > 1) {
-    auto t_run_end = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t_run_end - t_run_start).count();
-    fprintf(stderr, "[CHUNK_TIMING] Run total: %.1fms (%zu chunks)\n", total_ms, num_chunks);
   }
 
   // Clear the outputs of the pipeline models that are only run on prompt since this cannot happen earlier.
@@ -446,11 +397,6 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
   // subsequent decode steps see seqlens_k = real_length - 1.
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value() &&
       model_.config_->model.decoder.sliding_window->slide_inputs) {
-    if (std::getenv("ORTGENAI_WIN_REWIND_DEBUG")) {
-      fprintf(stderr,
-              "[WIN_REWIND] triggering: first_run=%d total_length=%d padded_total=%d num_chunks=%zu\n",
-              first_run_ ? 1 : 0, total_length, padded_total_, num_chunks);
-    }
     position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
   }
 
