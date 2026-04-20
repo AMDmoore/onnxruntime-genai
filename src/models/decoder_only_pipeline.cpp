@@ -397,7 +397,7 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
   // subsequent decode steps see seqlens_k = real_length - 1.
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value() &&
       model_.config_->model.decoder.sliding_window->slide_inputs) {
-    position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
+    position_inputs_->FinalizeChunkedPrefill();
   }
 
   first_run_ = false;
@@ -432,9 +432,9 @@ void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tok
   // For the chunked sliding-window path, WindowedInputIDs may emit a
   // window_size-shaped tensor that is larger than the actual_new tokens we are
   // appending (the last chunk includes pad tokens). Translate total_length into
-  // that padded coordinate system so RewindStaticMaskAfterPadding sees the
-  // right (real, padded) pair. For decode (actual_new == new_length == 1) this
-  // reduces to total_length unchanged.
+  // that padded coordinate system so position_inputs_->Update sees a total
+  // consistent with the padded next_tokens span it receives. For decode
+  // (actual_new == new_length == 1) this reduces to total_length unchanged.
   padded_total_ = (total_length - actual_new) + static_cast<int>(new_length);
 
   auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());

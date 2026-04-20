@@ -9,7 +9,7 @@ struct PositionInputs {
   virtual void RewindTo(size_t index) = 0;
   // Default no-op; overridden by WindowedPositionInputs to clear trailing pad
   // positions in the last prefill chunk's mask window after chunked prefill.
-  virtual void RewindStaticMaskAfterPadding(int real_length, int padded_length) {}
+  virtual void FinalizeChunkedPrefill() {}
 };
 
 struct DefaultPositionInputs : PositionInputs {
@@ -92,7 +92,7 @@ struct WindowedPositionInputs : PositionInputs {
 
   // After all prefill chunks have been processed, clear any pad positions in the
   // last chunk's mask window so that downstream decode sees mask sum == real_length.
-  void RewindStaticMaskAfterPadding(int real_length, int padded_length) override;
+  void FinalizeChunkedPrefill() override;
 
  private:
   State& state_;

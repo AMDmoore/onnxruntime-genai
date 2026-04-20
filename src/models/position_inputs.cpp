@@ -548,7 +548,7 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
         // duration of prefill). This mirrors DefaultPositionInputs behavior so
         // GroupQueryAttention sees a non-negative past_sequence_length during
         // chunked prefill. The pad positions are cleared later via
-        // RewindStaticMaskAfterPadding once all prefill chunks are processed.
+        // FinalizeChunkedPrefill once all prefill chunks are processed.
         WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
           using T = std::remove_pointer_t<decltype(attention_mask_data)>;
           std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, T{0});
@@ -565,7 +565,7 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
         // by window_size each step. The chunk's window_size bits are all set to
         // 1 for the duration of the chunk's prefill run so GQA sees the right
         // total seqlen; pad bits in the LAST chunk get cleared by
-        // RewindStaticMaskAfterPadding once the whole prefill batch is done.
+        // FinalizeChunkedPrefill once the whole prefill batch is done.
         // This keeps the layout's "1s grow leftward, contiguous" invariant
         // intact across multiple AppendTokenSequences calls (which is what
         // model_chat does when it appends the system prompt then the user
@@ -680,15 +680,12 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
   }
 }
 
-void WindowedPositionInputs::RewindStaticMaskAfterPadding(int real_length, int padded_length) {
+void WindowedPositionInputs::FinalizeChunkedPrefill() {
   // Called once after the final prefill chunk has been dispatched. We pre-filled
   // each chunk's window with all 1s so that GroupQueryAttention sees correct
   // past_sequence_length / total_sequence_length values per chunk; now we need
   // to clear the trailing pad positions in the LAST chunk's window so that
   // ReduceSum(attention_mask) - 1 reports (real_length - 1) at decode time.
-  (void)real_length;
-  (void)padded_length;
-
   if (!has_mask_input_) return;
   if (last_chunk_pad_count_ == 0) return;
   if (last_chunk_mask_start_ == ~0U) return;
