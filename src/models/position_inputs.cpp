@@ -503,6 +503,26 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
   // to the else "all chunks done" branch.)
   if (next_tokens.size() > 1 && window_index_ == 0) {
     num_windows_ = (next_tokens.size() + window_size_ - 1) / window_size_;
+
+    // Detect continuation prefill (multi-AppendTokenSequences). A non-null
+    // attention_mask_ means a prior prefill chunk has already run on this
+    // generator, so the mask + KV cache hold real state we must preserve.
+    // For continuation we count up position ids from past_real (= number of
+    // real tokens already in the KV cache, derived from the mask sum) and
+    // extend the mask leftward by window_size for the new chunk's window.
+    // For posid-only models without a mask, we fall back to past_real == 0
+    // (continuation across AppendTokens calls is not supported in that mode).
+    const bool is_continuation = (has_mask_input_ && attention_mask_ != nullptr);
+
+    size_t past_real = 0;
+    if (is_continuation) {
+      WithTypedConstData(*attention_mask_, attention_mask_type_, [&](auto const* data) {
+        for (int64_t i = 0; i < attention_mask_shape_[1]; ++i) {
+          past_real += static_cast<size_t>(data[i]);
+        }
+      });
+    }
+
     if (has_posid_input_) {
       // Restore window-shaped tensor in case a prior decode step shrank
       // position_ids_shape_ to [1, 1] (see the "all chunks done" branch below).
@@ -515,7 +535,10 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
 
       WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
         using T = std::remove_pointer_t<decltype(position_ids_data)>;
-        for (int i = 0, j = 0; i < position_ids_shape_[1]; i++) {
+        // Position ids count up from past_real for non-pad tokens (0 for the
+        // very first prefill). Pad tokens get position 0 so the model treats
+        // them as masked-out garbage; their outputs are discarded.
+        for (int i = 0, j = static_cast<int>(past_real); i < position_ids_shape_[1]; i++) {
           if (next_tokens.Span()[i] == model_.config_->model.pad_token_id) {
             position_ids_data[i] = T{0};
           } else {
@@ -526,21 +549,63 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
     }
 
     if (has_mask_input_) {
-      attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
+      if (!is_continuation) {
+        // First prefill ever: create a fresh mask with chunk-0's window at the
+        // rightmost edge of the buffer. Decode subsequently extends 1s leftward
+        // from attention_mask_backward_offset_.
+        attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
 
-      // Fill the entire chunk-0 window with 1s (treating pads as real for the
-      // duration of prefill). This mirrors DefaultPositionInputs behavior so
-      // GroupQueryAttention sees a non-negative past_sequence_length during
-      // chunked prefill. The pad positions are cleared later via
-      // RewindStaticMaskAfterPadding once all prefill chunks are processed.
-      WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
-        using T = std::remove_pointer_t<decltype(attention_mask_data)>;
-        std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, T{0});
-        std::fill_n(attention_mask_data + attention_mask_shape_[1] - window_size_, window_size_, T{1});
-      });
-      attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ - 1;
-      last_chunk_mask_start_ = attention_mask_shape_[1] - window_size_;
-      last_chunk_pad_count_ = count_pads_in_chunk(0);
+        // Fill the entire chunk-0 window with 1s (treating pads as real for the
+        // duration of prefill). This mirrors DefaultPositionInputs behavior so
+        // GroupQueryAttention sees a non-negative past_sequence_length during
+        // chunked prefill. The pad positions are cleared later via
+        // RewindStaticMaskAfterPadding once all prefill chunks are processed.
+        WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+          using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+          std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, T{0});
+          std::fill_n(attention_mask_data + attention_mask_shape_[1] - window_size_, window_size_, T{1});
+        });
+        attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ - 1;
+        last_chunk_mask_start_ = attention_mask_shape_[1] - window_size_;
+        last_chunk_pad_count_ = count_pads_in_chunk(0);
+      } else {
+        // Continuation prefill: PRESERVE the existing mask state (real bits
+        // from prior prefill chunks and decode steps) and place this chunk's
+        // window immediately left of attention_mask_backward_offset_, mirroring
+        // how the multi-chunk intermediate-window branch below extends leftward
+        // by window_size each step. The chunk's window_size bits are all set to
+        // 1 for the duration of the chunk's prefill run so GQA sees the right
+        // total seqlen; pad bits in the LAST chunk get cleared by
+        // RewindStaticMaskAfterPadding once the whole prefill batch is done.
+        // This keeps the layout's "1s grow leftward, contiguous" invariant
+        // intact across multiple AppendTokenSequences calls (which is what
+        // model_chat does when it appends the system prompt then the user
+        // prompt before calling GenerateNextToken).
+        const size_t window_end = attention_mask_backward_offset_ + 1;  // exclusive
+        // Require strictly more than window_size_ slots to the left of
+        // backward_offset, otherwise window_start would land at 0 and the
+        // subsequent decode step would have nowhere to extend (its
+        // backward_offset would clamp at 0 and overwrite an already-set bit).
+        if (window_end <= window_size_) {
+          throw std::runtime_error(
+              "WindowedPositionInputs: continuation prefill would exhaust the "
+              "attention_mask buffer (context_length=" + std::to_string(attention_mask_shape_[1]) +
+              ", window_size=" + std::to_string(window_size_) +
+              ", remaining left space=" + std::to_string(window_end) +
+              "). The model's context_length is too small to fit another chunked "
+              "prefill plus subsequent decode on top of the existing KV-cache "
+              "state. Either rebuild the model with a larger context_length or "
+              "merge the prompts into a single AppendTokenSequences call.");
+        }
+        const size_t window_start = window_end - window_size_;
+        WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+          using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+          std::fill_n(attention_mask_data + window_start, window_size_, T{1});
+        });
+        last_chunk_mask_start_ = window_start;
+        last_chunk_pad_count_ = count_pads_in_chunk(0);
+        attention_mask_backward_offset_ = window_start - 1;  // window_start > 0 guaranteed by check above
+      }
     }
   } else if (window_index_ < num_windows_) {
     if (has_posid_input_) {
