@@ -593,6 +593,8 @@ struct Decoder_Element : JSON::Element {
     } else if (name == "head_size") {
       v_.head_size = static_cast<int>(JSON::Get<double>(value));
     } else if (name == "fixed_prompt_length") {
+      // [NO_CHUNK_EXPERIMENTAL] See config.h banner. Mutually exclusive
+      // with sliding_window; validated post-parse in ParseConfig.
       v_.fixed_prompt_length = static_cast<int>(JSON::Get<double>(value));
     } else {
       throw JSON::unknown_value_error{};
@@ -1532,6 +1534,37 @@ Config::Config(const fs::path& path, std::string_view json_overlay) : config_pat
   // If no eos_token_id was set, set it to the pad token id
   if (model.eos_token_id.empty()) {
     model.eos_token_id.push_back(model.pad_token_id);
+  }
+
+  // Both sliding_window alignments are accepted at config load:
+  //   - alignment="left"  : tested path on this PR (chat / chunked prefill
+  //                         paired with DefaultKeyValueCache).
+  //   - alignment="right" : reference implementation for Phi-3.5-MoE-style
+  //                         models paired with WindowedKeyValueCache. RISK:
+  //                         NOT end-to-end validated on this stack; pairing
+  //                         with DefaultKeyValueCache will silently corrupt
+  //                         attention outputs. See class-level banner in
+  //                         src/models/position_inputs.h for details.
+  //
+  // TODO(sliding_window): add e2e coverage for alignment="right" before
+  //   promoting it to "fully supported".
+
+  // [NO_CHUNK_EXPERIMENTAL] fixed_prompt_length is mutually exclusive with
+  // sliding_window: the former routes the prompt through DefaultInputIDs /
+  // DefaultPositionInputs (single-Run static-shape path), the latter
+  // through WindowedInputIDs / WindowedPositionInputs (chunked path).
+  // Both drive the same input tensors of the session; a config that sets
+  // both is ambiguous and very likely a mistake, so reject at load time.
+  // If you want to A/B compare outputs between the two, produce two
+  // genai_config.json files and point the test at each in turn.
+  if (model.decoder.fixed_prompt_length > 0 && model.decoder.sliding_window.has_value()) {
+    throw std::runtime_error(
+        "Config sets both model.decoder.fixed_prompt_length (" +
+        std::to_string(model.decoder.fixed_prompt_length) +
+        ") and model.decoder.sliding_window. These are mutually exclusive "
+        "(experimental no-chunk path vs. chunked sliding-window path). "
+        "Remove one. See the [NO_CHUNK_EXPERIMENTAL] banner in "
+        "src/config.h for details.");
   }
 
   for (const auto& provider_option : model.decoder.session_options.provider_options) {

@@ -72,10 +72,13 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   if (is_prompt_ && state_.params_->search.num_beams > 1)
     sequence_length = static_cast<size_t>(new_tokens.size()) / state_.params_->search.batch_size;
 
+  // [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape path. When
+  // fixed_prompt_length is set the prompt (>1 token) is padded up to that
+  // length with pad_token_id inside this single-Run path; the sliding
+  // window path is not used. Config-load validation rejects configs that
+  // set both knobs, so we can freely assume they are mutually exclusive.
+  // See config.h banner for the full experimental-status description.
   const int fixed_prompt_length = model_.config_->model.decoder.fixed_prompt_length;
-  // Pad any multi-token input shorter than fixed_prompt_length.
-  // This covers both the initial prompt and subsequent AppendTokenSequences calls
-  // in continuous decoding (e.g., model_chat appends system prompt then user prompt).
   const bool should_pad = fixed_prompt_length > 0 &&
                            sequence_length > 1 &&
                            static_cast<int>(sequence_length) < fixed_prompt_length;
@@ -94,6 +97,7 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   auto data_span = value_->GetDeviceSpan<int32_t>();
 
   if (should_pad) {
+    // [NO_CHUNK_EXPERIMENTAL] Copy real tokens at the head, pad the tail.
     auto cpu_span = data_span.CpuSpan();
     auto src = new_tokens.CopyDeviceToCpu();
     std::copy(src.begin(), src.end(), cpu_span.begin());

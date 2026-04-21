@@ -355,11 +355,12 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
 
   // first_run_ should be thought of as prompt_processing_run_.
   // It is true only for the prompt processing part when the provided tokens are more than 1.
-  // Use padded shape (from input_ids_) to account for fixed_prompt_length padding.
+  // Use padded shape (from input_ids_) so the chunked sliding-window path sees
+  // window_size > 1 even on the last chunk.
   first_run_ = static_cast<size_t>(input_ids_->GetShape()[1]) > 1;
   size_t num_chunks{1};
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value()) {
-    int window_size = model_.config_->model.decoder.sliding_window->window_size;
+    const int window_size = model_.config_->model.decoder.sliding_window->window_size;
     num_chunks = (next_tokens.size() + window_size - 1) / window_size;
   }
 
@@ -389,6 +390,24 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
     }
   }
 
+  // Last-prefill-chunk pad cleanup (alignment="left") is handled by
+  // WindowedPositionInputs::Update itself via a two-phase defer/consume
+  // pair: DeferLastChunkPadClearLeft records the pad count at the end of
+  // the last prefill Update(), and ConsumeDeferredPadClearLeft zeros the
+  // mask cells at the TOP of the NEXT Update() call -- which may be a
+  // decode step OR the chunk-0 init of a subsequent AppendTokens() batch
+  // (chat mode's system-then-user flow). Either way the consume runs AFTER
+  // the last prefill Run() has completed, so total_sequence_length on that
+  // Run() still equals window_size*num_windows (GQA places K/V at the
+  // correct past_seq = forward_offset - window_size slot). No explicit
+  // post-prefill hook is needed here.
+
+  // [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape path. When
+  // fixed_prompt_length is set the prompt ran through DefaultInputIDs /
+  // DefaultPositionInputs in a single session.Run with pad tokens at the
+  // tail of input_ids; clear the matching trailing mask cells here so
+  // decode sees mask sum == real_length. Mutually exclusive with the
+  // sliding_window block above by config-load validation.
   const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
   if (first_run_ && fixed_len > 0 && total_length < padded_total_) {
     position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
@@ -423,10 +442,12 @@ void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tok
   input_ids_->Update(next_tokens);
   size_t new_length = input_ids_->GetShape()[1];
 
-  // For static-shape models with fixed_prompt_length padding, translate total_length
-  // into the padded coordinate system so that UpdateAttentionMaskStatic and
-  // UpdatePositionIds compute correct offsets (past_real + padded_new_length).
-  // For decode (actual_new == new_length == 1) this reduces to total_length unchanged.
+  // For the chunked sliding-window path, WindowedInputIDs may emit a
+  // window_size-shaped tensor that is larger than the actual_new tokens we are
+  // appending (the last chunk includes pad tokens). Translate total_length into
+  // that padded coordinate system so position_inputs_->Update sees a total
+  // consistent with the padded next_tokens span it receives. For decode
+  // (actual_new == new_length == 1) this reduces to total_length unchanged.
   padded_total_ = (total_length - actual_new) + static_cast<int>(new_length);
 
   auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
