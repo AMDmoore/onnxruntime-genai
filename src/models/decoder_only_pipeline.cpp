@@ -60,6 +60,16 @@ bool IntermediatePipelineState::SupportsPrimaryDevice() const {
       // cuda is not listed as one of the providers. This session does not support the cuda device type.
       return false;
     }
+  } else if (model_.p_device_->GetType() == DeviceType::DML) {
+    if (!model_.config_->model.decoder.pipeline[id_].session_options.has_value()) {
+      return true;
+    } else if (auto& provider_options = (*model_.config_->model.decoder.pipeline[id_].session_options).provider_options;
+               std::any_of(provider_options.begin(), provider_options.end(),
+                           [](const Config::ProviderOptions& elem) { return elem.name == "DML"; })) {
+      return true;
+    } else {
+      return false;
+    }
   }
 
   return false;
@@ -344,6 +354,7 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
         }
       }
     }
+
   }
 }
 
