@@ -390,14 +390,27 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
     }
   }
 
-  // For the chunked-prefill (sliding window) path, WindowedPositionInputs
-  // pre-filled each chunk's mask window with all 1s so GroupQueryAttention
-  // sees a non-negative past_sequence_length per chunk. Now that all prefill
-  // chunks are done, clear the pad positions in the last chunk's window so
-  // subsequent decode steps see seqlens_k = real_length - 1.
-  if (first_run_ && model_.config_->model.decoder.sliding_window.has_value() &&
-      model_.config_->model.decoder.sliding_window->slide_inputs) {
-    position_inputs_->FinalizeChunkedPrefill();
+  // Last-prefill-chunk pad cleanup (alignment="left") is handled by
+  // WindowedPositionInputs::Update itself via a two-phase defer/consume
+  // pair: DeferLastChunkPadClearLeft records the pad count at the end of
+  // the last prefill Update(), and ConsumeDeferredPadClearLeft zeros the
+  // mask cells at the TOP of the NEXT Update() call -- which may be a
+  // decode step OR the chunk-0 init of a subsequent AppendTokens() batch
+  // (chat mode's system-then-user flow). Either way the consume runs AFTER
+  // the last prefill Run() has completed, so total_sequence_length on that
+  // Run() still equals window_size*num_windows (GQA places K/V at the
+  // correct past_seq = forward_offset - window_size slot). No explicit
+  // post-prefill hook is needed here.
+
+  // [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape path. When
+  // fixed_prompt_length is set the prompt ran through DefaultInputIDs /
+  // DefaultPositionInputs in a single session.Run with pad tokens at the
+  // tail of input_ids; clear the matching trailing mask cells here so
+  // decode sees mask sum == real_length. Mutually exclusive with the
+  // sliding_window block above by config-load validation.
+  const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
+  if (first_run_ && fixed_len > 0 && total_length < padded_total_) {
+    position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
   }
 
   first_run_ = false;

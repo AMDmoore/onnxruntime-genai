@@ -72,6 +72,21 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   if (is_prompt_ && state_.params_->search.num_beams > 1)
     sequence_length = static_cast<size_t>(new_tokens.size()) / state_.params_->search.batch_size;
 
+  // [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape path. When
+  // fixed_prompt_length is set the prompt (>1 token) is padded up to that
+  // length with pad_token_id inside this single-Run path; the sliding
+  // window path is not used. Config-load validation rejects configs that
+  // set both knobs, so we can freely assume they are mutually exclusive.
+  // See config.h banner for the full experimental-status description.
+  const int fixed_prompt_length = model_.config_->model.decoder.fixed_prompt_length;
+  const bool should_pad = fixed_prompt_length > 0 &&
+                           sequence_length > 1 &&
+                           static_cast<int>(sequence_length) < fixed_prompt_length;
+
+  if (should_pad) {
+    sequence_length = static_cast<size_t>(fixed_prompt_length);
+  }
+
   if (static_cast<size_t>(shape_[1]) != sequence_length) {
     shape_[1] = sequence_length;
     value_->CreateTensor(shape_, state_.params_->use_graph_capture && shape_[1] == 1);
@@ -81,7 +96,14 @@ void DefaultInputIDs::Update(DeviceSpan<int32_t> new_tokens) {
   // Update input_ids with next tokens
   auto data_span = value_->GetDeviceSpan<int32_t>();
 
-  if (is_prompt_ && state_.params_->search.num_beams > 1) {
+  if (should_pad) {
+    // [NO_CHUNK_EXPERIMENTAL] Copy real tokens at the head, pad the tail.
+    auto cpu_span = data_span.CpuSpan();
+    auto src = new_tokens.CopyDeviceToCpu();
+    std::copy(src.begin(), src.end(), cpu_span.begin());
+    std::fill(cpu_span.begin() + src.size(), cpu_span.end(), model_.config_->model.pad_token_id);
+    data_span.CopyCpuToDevice();
+  } else if (is_prompt_ && state_.params_->search.num_beams > 1) {
     // For beam search
     int row_size = static_cast<int>(shape_[1]);
     for (int b = 0; b < shape_[0]; b++) {

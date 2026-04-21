@@ -423,6 +423,21 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
     throw std::runtime_error("Continuous decoding is not supported on the selected device type (" + to_string(state_->model_.p_device_kvcache_->GetType()) +
                              "). Please recreate the generator instance to avoid using continuous decoding.");
 
+  // [NO_CHUNK_EXPERIMENTAL] The legacy fixed_prompt_length path was never
+  // designed for continuous decoding (chat mode's multiple AppendTokens
+  // calls): the single-Run static-shape flow has no notion of a running
+  // KV history across separate prompt batches. Reject explicitly rather
+  // than silently corrupting outputs. Use the sliding_window path with
+  // alignment="left" for chat-style scenarios.
+  if (search_->GetSequenceLength() != 0 &&
+      model_->config_->model.decoder.fixed_prompt_length > 0) {
+    throw std::runtime_error(
+        "Continuous decoding (multiple AppendTokens calls) is not supported "
+        "on the experimental fixed_prompt_length path. Use sliding_window "
+        "with alignment=\"left\" instead, or call RewindToLength(0) before "
+        "the next AppendTokens call.");
+  }
+
   // Set any extra inputs (those defined in extra_inputs and those defined in the PresetExtraInputs registry)
   if (set_extra_inputs_) {
     state_->SetExtraInputs(extra_inputs_);
