@@ -1532,6 +1532,52 @@ Config::Config(const fs::path& path, std::string_view json_overlay) : config_pat
     model.eos_token_id.push_back(model.pad_token_id);
   }
 
+  // EXPERIMENTAL / IN-DEVELOPMENT scope restriction: only alignment="left" is
+  // exercised and verified on the windowed (chunked-prefill) path right now.
+  //
+  // Background for future maintainers / contributors:
+  //   WindowedPositionInputs / WindowedInputIDs currently assume pads sit at
+  //   the trailing edge of each prefill chunk's window. The prefill mask is
+  //   painted with all 1s, then FinalizeChunkedPrefill clears
+  //   `last_chunk_pad_count_` slots at the END of the LAST chunk's window,
+  //   and decode walks the mask leftward from there.
+  //
+  //   With alignment="right", AllocateInputIdsOnDevice (in generators.cpp)
+  //   places pads at the HEAD of the buffer instead, so the host-side mask
+  //   bookkeeping no longer matches the actual K/V slot layout -- the
+  //   cleared mask slots would correspond to real-token K/V (single-chunk
+  //   case) or the leading pad slots would never be cleared at all
+  //   (multi-chunk case, since FinalizeChunkedPrefill only touches the last
+  //   chunk). Either way the model would silently attend to pad K/V or miss
+  //   real K/V.
+  //
+  //   Proper support for alignment="right" needs the windowed classes to be
+  //   alignment-aware (e.g. clearing chunk-0's leading pads after chunk 0
+  //   instead of last-chunk's trailing pads after Finalize, plus matching
+  //   adjustments in continuation-prefill mask placement). This is left as
+  //   future work; until then we hard-fail at config-load so the failure is
+  //   loud and immediate rather than a silent KV-cache corruption at
+  //   generation time.
+  //
+  // TODO(sliding_window): remove this gate once WindowedPositionInputs /
+  //   WindowedInputIDs handle alignment="right" end-to-end and there are
+  //   tests covering both alignments.
+  if (model.decoder.sliding_window.has_value() &&
+      model.decoder.sliding_window->alignment != "left") {
+    std::ostringstream oss;
+    oss << "model.decoder.sliding_window.alignment must be \"left\" "
+        << "(got \"" << model.decoder.sliding_window->alignment << "\"). "
+        << "EXPERIMENTAL: the windowed (chunked-prefill) path is currently "
+        << "in development and only alignment=\"left\" is exercised and "
+        << "verified. WindowedPositionInputs assumes pads trail real tokens "
+        << "within each chunk; alignment=\"right\" would silently corrupt "
+        << "the KV cache and is intentionally rejected up front. Set "
+        << "\"sliding_window\": { \"alignment\": \"left\", ... } in "
+        << "genai_config.json. (Support for alignment=\"right\" is planned "
+        << "future work -- contributions welcome.)";
+    throw std::runtime_error(oss.str());
+  }
+
   for (const auto& provider_option : model.decoder.session_options.provider_options) {
     model.decoder.session_options.providers.push_back(provider_option.name);
   }
