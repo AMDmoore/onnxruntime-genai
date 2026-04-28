@@ -70,6 +70,20 @@ bool IntermediatePipelineState::SupportsPrimaryDevice() const {
     } else {
       return false;
     }
+  } else if (model_.p_device_->GetType() == DeviceType::MorphiZenEP) {
+    // Same logic as CUDA/DML above. Pipeline sub-models that omit
+    // session_options inherit the primary device (MorphiZenEP); when they
+    // do specify provider_options, they must list "MorphiZenEP" to be
+    // considered compatible with the primary-device managed inputs/outputs.
+    if (!model_.config_->model.decoder.pipeline[id_].session_options.has_value()) {
+      return true;
+    } else if (auto& provider_options = (*model_.config_->model.decoder.pipeline[id_].session_options).provider_options;
+               std::any_of(provider_options.begin(), provider_options.end(),
+                           [](const Config::ProviderOptions& elem) { return elem.name == "MorphiZenEP"; })) {
+      return true;
+    } else {
+      return false;
+    }
   }
 
   return false;

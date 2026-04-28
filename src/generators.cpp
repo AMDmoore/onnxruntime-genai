@@ -21,6 +21,7 @@
 #include "webgpu/interface.h"
 #include "openvino/interface.h"
 #include "ryzenai/interface.h"
+#include "morphizen_ep/interface.h"
 #include "engine/engine.h"
 
 #if defined(_WIN32)
@@ -102,6 +103,7 @@ void Shutdown() {
   GetOrtGlobals().reset();  // Delete now because on process exit is too late
 
   RyzenAIInterface::Shutdown();
+  MorphiZenEPInterface::Shutdown();
 }
 
 OrtEnv& GetOrtEnv() {
@@ -234,6 +236,8 @@ std::string to_string(DeviceType device_type) {
       return "NvTensorRtRtx";
     case DeviceType::RyzenAI:
       return "RyzenAI";
+    case DeviceType::MorphiZenEP:
+      return "MorphiZenEP";
     default:
       throw std::runtime_error("Unknown device type");
   }
@@ -259,6 +263,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
       return GetOpenVINOInterface();
     case DeviceType::RyzenAI:
       return GetRyzenAIInterface();
+    case DeviceType::MorphiZenEP:
+      return GetMorphiZenEPInterface();
   }
 }
 

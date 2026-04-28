@@ -428,10 +428,17 @@ bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
   // allocation path on CPU when fixed_prompt_length is in use (the original
   // path the legacy mode was designed for). The sliding_window path has its
   // own mask management and does not rely on this predicate on CPU.
+  // MorphiZenEP must be treated like CPU here because the morphizen-compiled
+  // models expect attention_mask of shape [batch, max_length] (fixed-shape,
+  // matching the prefill_p128m16384.onnx / decode_p128m16384.onnx pair). Before
+  // path A, OGA misclassified MorphiZenEP as CPU and took this branch by
+  // accident; now that MorphiZenEP has its own DeviceType we add it
+  // explicitly so attention_mask shape stays compatible with the model.
   return state_.params_->use_graph_capture ||
          (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
           (model_.p_device_->GetType() == DeviceType::NvTensorRtRtx ||
-           model_.p_device_->GetType() == DeviceType::CPU));
+           model_.p_device_->GetType() == DeviceType::CPU ||
+           model_.p_device_->GetType() == DeviceType::MorphiZenEP));
 }
 
 namespace {
