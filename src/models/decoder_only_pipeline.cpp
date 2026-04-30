@@ -71,10 +71,6 @@ bool IntermediatePipelineState::SupportsPrimaryDevice() const {
       return false;
     }
   } else if (model_.p_device_->GetType() == DeviceType::MorphiZenEP) {
-    // Same logic as CUDA/DML above. Pipeline sub-models that omit
-    // session_options inherit the primary device (MorphiZenEP); when they
-    // do specify provider_options, they must list "MorphiZenEP" to be
-    // considered compatible with the primary-device managed inputs/outputs.
     if (!model_.config_->model.decoder.pipeline[id_].session_options.has_value()) {
       return true;
     } else if (auto& provider_options = (*model_.config_->model.decoder.pipeline[id_].session_options).provider_options;
@@ -82,7 +78,12 @@ bool IntermediatePipelineState::SupportsPrimaryDevice() const {
                            [](const Config::ProviderOptions& elem) { return elem.name == "MorphiZenEP"; })) {
       return true;
     } else {
-      return false;
+      // Scenario: VLM pipeline where the embedding sub-model runs on
+      // CPU EP (session_options: {}).
+      // For MorphiZenEP, p_device_inputs_ defaults to CPU, so managed
+      // inputs (input_ids, etc.) reside in CPU memory. MorphiZenEP can
+      // also access CPU memory, so the sub-model is compatible.
+      return model_.p_device_inputs_->GetType() == DeviceType::CPU;
     }
   }
 
