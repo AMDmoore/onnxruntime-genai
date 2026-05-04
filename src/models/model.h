@@ -62,6 +62,15 @@ struct State {
   std::string graph_id_{};
   std::shared_ptr<Adapters> adapters_;
   ExtraOutputs extra_outputs_;
+
+  // OGA_USE_IO_BINDING fast-path state. When the env var is set and every
+  // output on a given call is pre-allocated, Run() routes through this
+  // binding to skip ORT's per-call name resolution and argument validation.
+  // The binding is rebuilt on each call -- the win comes from the binding
+  // execution path itself, not from bind-once-reuse.
+  std::unique_ptr<OrtIoBinding> io_binding_;
+  bool use_io_binding_{false};
+  bool io_binding_env_resolved_{false};
 };
 
 struct TokenizerStream : LeakChecked<TokenizerStream> {
