@@ -4,7 +4,6 @@
 // Modifications Copyright(C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 #include <algorithm>
 #include <climits>
-#include <cstdlib>
 #include <random>
 #include <set>
 #include <string>
@@ -155,27 +154,18 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
     run_options_->AddConfigEntry("disable_synchronize_execution_providers", "1");
   }
 
-  // OGA_USE_IO_BINDING (env var, opt-in) routes session.Run through an
-  // OrtIoBinding instead of the dictionary-style overload, skipping ORT's
-  // per-call input/output name resolution and argument validation. On
-  // decode-heavy workloads this is worth ~13-17 ms/token (measured on
-  // Strix Halo). Resolved once per State.
-  if (!io_binding_env_resolved_) {
-    const char* env = std::getenv("OGA_USE_IO_BINDING");
-    use_io_binding_ = (env && env[0] == '1');
-    io_binding_env_resolved_ = true;
-  }
-
-  // The binding path requires every output to be pre-allocated. When an
-  // output is null (e.g. extra_outputs that ORT must allocate itself for
-  // dynamic-shape variants), fall back to the dict-style Run for this call.
-  bool can_bind_outputs = use_io_binding_;
-  if (can_bind_outputs) {
-    for (size_t i = 0; i < output_names_.size(); ++i) {
-      if (outputs_[i] == nullptr) {
-        can_bind_outputs = false;
-        break;
-      }
+  // Route session.Run through an OrtIoBinding when every output for this
+  // call is pre-allocated. The binding skips ORT's per-call input/output
+  // name resolution and argument validation, which is significant overhead
+  // on short decode steps. Falls back to the dictionary-style overload
+  // when any output is null (e.g. extra outputs that ORT must allocate
+  // itself for dynamic-shape variants), since OrtIoBinding requires a
+  // pre-allocated tensor for every bound output.
+  bool can_bind_outputs = true;
+  for (size_t i = 0; i < output_names_.size(); ++i) {
+    if (outputs_[i] == nullptr) {
+      can_bind_outputs = false;
+      break;
     }
   }
 
