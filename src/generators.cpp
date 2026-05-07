@@ -404,8 +404,11 @@ Generator::~Generator() {
   }
 
   // ---- Helpers -------------------------------------------------------------
-  // Pretty-print non-negative microsecond values with thousands separators
-  // and 2 decimal places, right-aligned in a fixed width so columns line up.
+  // Layout: 2-space outer indent + per-row indent + label (left-justified to
+  // value column) + 14-char right-aligned value + " us  (" + 6-char % + " %)".
+  // Total line width = kValueCol + 30 chars, regardless of indent.
+  constexpr int kValueCol = 56;
+
   auto fmt_us = [](double us, int width) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.2f", us < 0.0 ? 0.0 : us);
@@ -425,27 +428,43 @@ Generator::~Generator() {
     std::snprintf(buf, sizeof(buf), "%6.2f", den > 0.0 ? (num / den) * 100.0 : 0.0);
     return std::string(buf);
   };
-  // Section banner sized to match the 80-char ==== separator below.
-  // Layout: "+---- " (6) + title + " " (1) + dashes + "+" (1) == 80 chars
-  //   => dashes_len = 72 - len(title)
-  auto print_section_header = [](const char* title) {
-    const int dashes_len = std::max(0, 72 - static_cast<int>(std::strlen(title)));
-    const std::string dashes(static_cast<size_t>(dashes_len), '-');
-    std::fprintf(stderr, "\n+---- %s %s+\n", title, dashes.c_str());
+
+  // Row with value + percent (used for breakdown children and totals).
+  auto row = [&](int indent, const char* label, double us, double total_us) {
+    const int label_w = std::max(1, kValueCol - indent);
+    std::fprintf(stderr, "%*s%-*s %s us  (%s %%)\n",
+                 indent, "",
+                 label_w, label,
+                 fmt_us(us, 14).c_str(),
+                 fmt_pct(us, total_us).c_str());
   };
-  // Hierarchical breakdown row for the per-call decomposition table. The label
-  // column is wide enough (62 chars) to accommodate the longest label without
-  // breaking alignment.
-  auto row = [&](const char* prefix, const char* label, double us_per_call,
-                 double total_us_per_call, const char* note) {
-    std::fprintf(stderr,
-                 "  %-4s %-62s %s us  (%s %%)%s%s\n",
-                 prefix,
-                 label,
-                 fmt_us(us_per_call, 14).c_str(),
-                 fmt_pct(us_per_call, total_us_per_call).c_str(),
-                 (note && note[0]) ? "  " : "",
-                 note ? note : "");
+  // Row without percent (per-stage averages: setup / inner / teardown).
+  auto row_no_pct = [&](int indent, const char* label, double us) {
+    const int label_w = std::max(1, kValueCol - indent);
+    std::fprintf(stderr, "%*s%-*s %s us\n",
+                 indent, "",
+                 label_w, label,
+                 fmt_us(us, 14).c_str());
+  };
+  // Divider line spanning the same width as a data row at this indent.
+  auto divider = [&](int indent) {
+    const int len = std::max(8, (kValueCol + 30) - indent);
+    const std::string dashes(static_cast<size_t>(len), '-');
+    std::fprintf(stderr, "%*s%s\n", indent, "", dashes.c_str());
+  };
+  // Phase header: leading blank lines, thick rule, title, call-label,
+  // then a thin rule before the body. The thick rules above and below each
+  // phase make the boundaries between PREFILL / DECODE / FIRST-TOKEN
+  // SAMPLING obvious at a glance.
+  const std::string thick_rule(80, '=');
+  const std::string thin_rule(80, '-');
+  auto section_header = [&](const char* title, const char* call_label) {
+    std::fprintf(stderr, "\n\n%s\n", thick_rule.c_str());
+    std::fprintf(stderr, "  %s\n", title);
+    if (call_label && call_label[0]) {
+      std::fprintf(stderr, "  %s\n", call_label);
+    }
+    std::fprintf(stderr, "%s\n", thin_rule.c_str());
   };
 
   // ---- Pull State stats if available, then suppress its own destructor print
@@ -488,6 +507,8 @@ Generator::~Generator() {
         have_state ? (state_stats->outer_ns / 1000.0) / state_runs : 0.0;
     const double chunks_per_run = (have_state && state_runs > 0.0) ? state_steps / state_runs : 0.0;
     const double stages_per_run = (have_state && state_runs > 0.0) ? state_stages / state_runs : 0.0;
+    const double stages_per_chunk =
+        (have_state && state_steps > 0.0) ? state_stages / state_steps : 0.0;
 
     const double per_stage_setup_us =
         have_state ? (state_stats->setup_ns / 1000.0) / state_stages : 0.0;
@@ -508,130 +529,125 @@ Generator::~Generator() {
         have_state ? std::max(0.0, gen_total_us - state_inner_us) : 0.0;
 
     // ---- Print
-    print_section_header(phase_title);
-    std::fprintf(stderr, "  %s\n", call_label);
-    std::fprintf(stderr, "  Calls: %llu", static_cast<unsigned long long>(gen_stats.calls));
+    section_header(phase_title, call_label);
+    std::fprintf(stderr, "  Calls       : %llu\n",
+                 static_cast<unsigned long long>(gen_stats.calls));
     if (have_state) {
-      std::fprintf(stderr, "   |   chunks/Run: %.2f   |   stages/Run: %.2f",
-                   chunks_per_run, stages_per_run);
+      std::fprintf(stderr,
+                   "  Topology    : %.2f chunks/Run   %.2f stages/Run   %.2f stages/chunk\n",
+                   chunks_per_run, stages_per_run, stages_per_chunk);
     }
-    std::fprintf(stderr, "\n");
     std::fprintf(stderr,
-                 "  Wall clock per call: %s us  (%.2f ms)   <- compare to benchmark \"%s\"\n",
-                 fmt_us(gen_total_us, 14).c_str(), gen_total_us / 1000.0, benchmark_ref);
-    std::fprintf(stderr, "\n  Decomposition (sums to wall clock above):\n");
+                 "  Wall clock  : %s us  (%.2f ms)\n"
+                 "                benchmark \"%s\"\n",
+                 fmt_us(gen_total_us, 0).c_str(),
+                 gen_total_us / 1000.0,
+                 benchmark_ref);
 
     if (have_state) {
-      row("*",  "inner session.Run (ORT model compute)", state_inner_us, gen_total_us,
-          "<- irreducible ORT compute (model kernel time)");
-      row(".",  "Generator scaffolding (outside State::Run)", gen_scaffolding_us, gen_total_us, "");
-      row(" \\-", "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us,
-          "[required: picks next token from logits]");
-      row(" \\-", other_row_label, gen_other_us, gen_total_us,
-          "[required functional work; see Notes]");
-      row(".",  "in-RunPipeline orchestration (rebind across stages)",
-          state_orch_us, gen_total_us,
-          "[pipeline-mode only: rebind + cross-stage output forwarding]");
-      row(".",  "outside RunPipeline (UpdateIO + chunk-slide + cleanup)",
-          state_outer_us, gen_total_us,
-          "[mostly required: KV/positions/mask update]");
-      std::fprintf(stderr,
-                   "  ---------------------------------------------------------------------------\n"
-                   "  Total CPU time outside inner session.Run:\n"
-                   "  %s us  (%s %% of wall clock)\n"
-                   "  -- mix of REQUIRED functional work (sampling, per-token search ops,\n"
-                   "     guidance, KV/mask update) and AVOIDABLE orchestration overhead\n"
-                   "     (per-stage rebinds, ortvalue_store_ lookups). See Notes below.\n",
-                   fmt_us(oga_overhead_us, 14).c_str(),
-                   fmt_pct(oga_overhead_us, gen_total_us).c_str());
-      // Per-stage average inside RunPipeline. The "stages/chunk" multiplier
-      // makes the relationship to per-chunk wall clock explicit:
-      //   per-chunk RunPipeline = (setup + inner + teardown) * stages/chunk
-      const double stages_per_chunk =
-          state_stats->steps > 0 ? state_stages / state_steps : 0.0;
-      std::fprintf(stderr,
-                   "\n"
-                   "  In-RunPipeline per-stage avg (n=%llu stages, %.2f stage/chunk):\n"
-                   "      setup %s + inner %s + teardown %s us\n"
-                   "      => per-chunk RunPipeline = (setup+inner+teardown) * stages/chunk\n",
-                   static_cast<unsigned long long>(state_stats->stages),
-                   stages_per_chunk,
-                   fmt_us(per_stage_setup_us, 0).c_str(),
-                   fmt_us(per_stage_inner_us, 0).c_str(),
-                   fmt_us(per_stage_teardown_us, 0).c_str());
+      // Per-call inner / orchestration rows decompose into per-stage averages
+      // multiplied by stages/Run. Both equalities are surfaced inline below
+      // so the reader can follow the data flow without cross-referencing.
+      char inner_eq[80];
+      char orch_eq[80];
+      std::snprintf(inner_eq, sizeof(inner_eq),
+                    "= inner %s * %.2f stages/Run",
+                    fmt_us(per_stage_inner_us, 0).c_str(), stages_per_run);
+      std::snprintf(orch_eq, sizeof(orch_eq),
+                    "= (setup %s + teardown %s) * %.2f stages/Run",
+                    fmt_us(per_stage_setup_us, 0).c_str(),
+                    fmt_us(per_stage_teardown_us, 0).c_str(),
+                    stages_per_run);
 
-      // Per-chunk breakdown -- only meaningful when the chunk loop runs
-      // multiple times (sliding-window prefill). For decode (1 chunk/call)
-      // the per-chunk number is identical to the wall-clock-per-call line
-      // already printed above, so we skip it.
+      std::fprintf(stderr, "\n  Decomposition (children sum to wall clock):\n");
+      row(4, "inner session.Run", state_inner_us, gen_total_us);
+      std::fprintf(stderr, "        %s\n", inner_eq);
+      row(4, "Generator scaffolding (outside State::Run)", gen_scaffolding_us, gen_total_us);
+      row(6, "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us);
+      row(6, other_row_label, gen_other_us, gen_total_us);
+      row(4, "in-RunPipeline orchestration", state_orch_us, gen_total_us);
+      std::fprintf(stderr, "        %s\n", orch_eq);
+      row(4, "outside RunPipeline (UpdateIO + slide + cleanup)", state_outer_us, gen_total_us);
+      divider(4);
+      row(4, "= Wall clock per call", gen_total_us, gen_total_us);
+      row(4, "    of which CPU outside inner session.Run", oga_overhead_us, gen_total_us);
+
+      // Per-chunk breakdown -- only printed when the chunk loop runs multiple
+      // times (sliding-window prefill). For decode (1 chunk/Run) the per-chunk
+      // number equals the per-call wall clock; the per-stage averages already
+      // appear inline in the Decomposition above, so we skip this subsection.
       if (chunks_per_run > 1.0 && state_stats->steps > 0) {
         const double per_chunk_total_us =
-            (state_stats->chunk_loop_body_ns / 1000.0) / static_cast<double>(state_stats->steps);
-        // RunPipeline portion per chunk = total RunPipeline time across the phase
-        // divided by the number of chunks (== number of RunPipeline calls).
+            (state_stats->chunk_loop_body_ns / 1000.0) / state_steps;
         const double per_chunk_runpipeline_us =
-            ((state_stats->setup_ns + state_stats->inner_run_ns + state_stats->teardown_ns) /
-             1000.0) /
-            static_cast<double>(state_stats->steps);
-        // Slide block runs (steps - runs) times total: once per chunk EXCEPT the
-        // last chunk of each Run. Average per actual slide invocation.
+            ((state_stats->setup_ns + state_stats->inner_run_ns +
+              state_stats->teardown_ns) / 1000.0) / state_steps;
+        // Slide block runs (steps - runs) times per phase: once per chunk
+        // EXCEPT the last chunk of each Run. To keep the per-chunk
+        // decomposition additive (children sum to wall clock), the row value
+        // is amortized over ALL chunks rather than over slide invocations.
+        // The per-invocation cost is still surfaced inline beneath.
+        const double slide_total_us = std::max(
+            0.0,
+            (per_chunk_total_us - per_chunk_runpipeline_us) * state_steps);
+        const double per_chunk_slide_us = slide_total_us / state_steps;
         const uint64_t total_slides =
             state_stats->steps > state_stats->runs ? state_stats->steps - state_stats->runs : 0;
-        const double slide_total_us =
-            std::max(0.0,
-                     (per_chunk_total_us - per_chunk_runpipeline_us) *
-                         static_cast<double>(state_stats->steps));
-        const double per_slide_us =
+        const double per_slide_invocation_us =
             total_slides > 0 ? slide_total_us / static_cast<double>(total_slides) : 0.0;
-        const unsigned long long slides_per_run =
-            static_cast<unsigned long long>(total_slides / std::max<uint64_t>(1, state_stats->runs));
-        char slide_note[64];
-        std::snprintf(slide_note, sizeof(slide_note), "[runs %llu times per Run() call]", slides_per_run);
+        const unsigned long long slides_per_run = static_cast<unsigned long long>(
+            total_slides / std::max<uint64_t>(1, state_stats->runs));
 
         std::fprintf(stderr,
-                     "\n  Per-chunk wall clock (n=%llu chunks across %llu Run() calls):\n",
-                     static_cast<unsigned long long>(state_stats->steps),
+                     "\n  Per-chunk wall clock (%.0f chunks/Run, %llu Run total):\n",
+                     chunks_per_run,
                      static_cast<unsigned long long>(state_stats->runs));
-        row("*", "inner + orchestration (one RunPipeline per chunk)",
-            per_chunk_runpipeline_us, per_chunk_total_us, "");
-        row(".", "between-chunk slide (KV / positions / logits Update)",
-            per_slide_us, per_chunk_total_us, slide_note);
+        row(4, "RunPipeline (1/chunk)", per_chunk_runpipeline_us, per_chunk_total_us);
         std::fprintf(stderr,
-                     "  -----------------------------------------------------------"
-                     "-----------------------------------\n");
-        row(" ", "per-chunk wall clock", per_chunk_total_us, per_chunk_total_us, "");
+                     "        = (setup %s + inner %s + teardown %s) * %.2f stages/chunk\n",
+                     fmt_us(per_stage_setup_us, 0).c_str(),
+                     fmt_us(per_stage_inner_us, 0).c_str(),
+                     fmt_us(per_stage_teardown_us, 0).c_str(),
+                     stages_per_chunk);
+        row(4, "between-chunk slide (KV / positions / mask)",
+            per_chunk_slide_us, per_chunk_total_us);
+        std::fprintf(stderr,
+                     "        = %s us/invocation * %llu invocations / %.0f chunks\n",
+                     fmt_us(per_slide_invocation_us, 0).c_str(),
+                     slides_per_run,
+                     chunks_per_run);
+        divider(4);
+        row(4, "= per-chunk wall clock", per_chunk_total_us, per_chunk_total_us);
       }
     } else {
       // No State data: degraded view from Generator stats only.
       const double gen_cl_us = (gen_stats.compute_logits_ns / 1000.0) / calls;
       const double gen_other_only_us = std::max(0.0, gen_total_us - gen_cl_us - gen_sampling_us);
-      row("*",  "ComputeLogits (state_->Run)", gen_cl_us, gen_total_us,
-          "<- model + State scaffolding (lumped)");
-      row(".",  "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us, "");
-      row(".",  "other (search ops, validation, guidance)", gen_other_only_us, gen_total_us, "");
-      std::fprintf(stderr,
-                   "  Note: detailed State::Run breakdown unavailable for this State type.\n");
+      std::fprintf(stderr, "\n  Decomposition (children sum to wall clock):\n");
+      row(4, "ComputeLogits (state_->Run, lumped)", gen_cl_us, gen_total_us);
+      row(4, "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us);
+      row(4, "other (search ops, validation, guidance)", gen_other_only_us, gen_total_us);
+      divider(4);
+      row(4, "= Wall clock per call", gen_total_us, gen_total_us);
+      std::fprintf(stderr, "  (detailed State::Run breakdown unavailable for this State type)\n");
     }
   };
 
   std::fprintf(stderr,
-               "\n"
-               "================================================================================\n"
-               "[OGA profile] Per-call CPU breakdown summary\n"
-               "              (gated by ORTGENAI_PIPELINE_OVERHEAD_PROFILE=1)\n"
-               "================================================================================\n");
+               "\n[OGA profile] Per-call CPU breakdown"
+               "   (ORTGENAI_PIPELINE_OVERHEAD_PROFILE=1)\n");
 
   print_phase("PREFILL  (prompt processing)",
-              "AppendTokens()  -- one call per prompt batch",
+              "AppendTokens(), one call per prompt batch",
               "Prompt processing (time to first token): avg (us)",
-              "other (input alloc + search.Append + SetLogits; once/call)",
+              "other (alloc + search.Append + ComputeLogits epilogue)",
               append_tokens_stats_,
               pipe_state ? &state_prefill : nullptr);
 
   print_phase("DECODE  (token generation)",
-              "GenerateNextToken()  -- ComputeLogits then sample, repeated per token",
+              "GenerateNextToken(), once per generated token",
               "Token generation: avg (us)",
-              "other (per-token: MinLen + RepPen + guidance + SetLogits)",
+              "other (per-token: MinLen + RepPen + guidance + epilogue)",
               generate_next_token_with_logits_stats_,
               pipe_state ? &state_decode : nullptr);
 
@@ -644,60 +660,66 @@ Generator::~Generator() {
     const double total_us = (generate_next_token_sample_only_stats_.total_ns / 1000.0) / calls;
     const double samp_us = (generate_next_token_sample_only_stats_.sampling_ns / 1000.0) / calls;
     const double other_us = std::max(0.0, total_us - samp_us);
-    print_section_header("FIRST-TOKEN SAMPLING (no ComputeLogits)");
+    section_header("FIRST-TOKEN SAMPLING (no ComputeLogits)",
+                   "GenerateNextToken(), 1st call (logits already computed)");
+    std::fprintf(stderr, "  Calls       : %llu\n",
+                 static_cast<unsigned long long>(generate_next_token_sample_only_stats_.calls));
     std::fprintf(stderr,
-                 "  GenerateNextToken()  -- 1st call after AppendTokens (logits already computed)\n"
-                 "  Calls: %llu\n"
-                 "  Wall clock per call: %s us   <- compare to benchmark \"Token sampling: avg (us)\"\n"
-                 "      sampling (SelectTop / Sample*): %s us  (%s %%)\n"
-                 "      other:                          %s us  (%s %%)\n",
-                 static_cast<unsigned long long>(generate_next_token_sample_only_stats_.calls),
-                 fmt_us(total_us, 0).c_str(),
-                 fmt_us(samp_us, 0).c_str(),
-                 fmt_pct(samp_us, total_us).c_str(),
-                 fmt_us(other_us, 0).c_str(),
-                 fmt_pct(other_us, total_us).c_str());
+                 "  Wall clock  : %s us\n"
+                 "                benchmark \"Token sampling: avg (us)\"\n",
+                 fmt_us(total_us, 0).c_str());
+    std::fprintf(stderr, "\n  Decomposition (children sum to wall clock):\n");
+    row(4, "sampling (SelectTop / Sample*)", samp_us, total_us);
+    row(4, "other", other_us, total_us);
+    divider(4);
+    row(4, "= Wall clock per call", total_us, total_us);
   }
 
+  // Single, compact Notes block. Anything previously inlined per-row now
+  // lives here so the report stays scannable and the explanation appears
+  // exactly once.
   std::fprintf(stderr,
-               "\nNotes:\n"
-               "  * \"inner session.Run\" is the actual ONNX Runtime model compute on the EP.\n"
-               "    All other rows above are CPU work that lives outside the model kernel,\n"
-               "    but they are NOT all \"overhead\" in the avoidable sense:\n"
-               "      REQUIRED (cannot be removed without breaking output):\n"
-               "         - sampling (SelectTop / Sample*)        -- picks next token\n"
-               "         - \"other\" row (per-phase, see below)    -- search ops, guidance, alloc\n"
-               "         - chunk-slide (KV / positions / logits) -- sliding-window correctness\n"
-               "      AVOIDABLE (genuine orchestration overhead specific to pipeline mode):\n"
-               "         - in-RunPipeline orchestration          -- per-stage I/O rebind,\n"
-               "                                                    ortvalue_store_ lookups,\n"
-               "                                                    HasInput/HasOutput scans\n"
-               "         - small bookkeeping inside outside-RunPipeline (post-loop cleanup)\n"
-               "  * \"other\" expands differently per phase:\n"
-               "      - PREFILL:  per call (once/prompt) -- AllocateInputIdsOnDevice,\n"
-               "                  search_->AppendTokens, ComputeLogits epilogue (SetLogits,\n"
-               "                  optional guidance.CommitTokens / fast-forward tokens).\n"
-               "      - DECODE:   per token -- ApplyMinLength, ApplyRepetitionPenalty,\n"
-               "                  optional guidance.ProcessLogits, ComputeLogits epilogue.\n"
-               "                  These per-token search ops are why DECODE \"other\" is\n"
-               "                  larger per call than PREFILL \"other\".\n"
-               "  * \"In-RunPipeline per-stage avg\" relates to the per-chunk RunPipeline\n"
-               "    row above by exactly the stages/chunk multiplier:\n"
-               "      per-chunk RunPipeline = (setup + inner + teardown) * stages/chunk\n"
-               "    With 1 stage/chunk (typical) the per-chunk number == sum of the three\n"
-               "    per-stage numbers; multi-stage pipelines (e.g. embed + transformer)\n"
-               "    multiply accordingly.\n"
-               "  * chunks/Run and stages/Run are per State::Run() invocation, NOT per\n"
-               "    Generator-level call. They coincide in the normal flow because each\n"
-               "    AppendTokens / GenerateNextToken triggers exactly one State::Run\n"
-               "    (the only exception is the guidance fast-forward path in\n"
-               "    Generator::ComputeLogits, which fires a 2nd state_->Run inside the\n"
-               "    same AppendTokens call -- rare in practice).\n"
-               "  * PREFILL \"Wall clock per call\" measures Generator::AppendTokens only.\n"
-               "    The benchmark wraps Generator::AppendTokenSequences, which also calls\n"
-               "    Generators::PadInputs(). The PadInputs cost is small but not counted\n"
-               "    here, so this number can be a few microseconds below the benchmark\n"
-               "    \"Prompt processing\" total.\n"
+               "\n"
+               "Notes\n"
+               "--------------------------------------------------------------------------------\n"
+               "  Layout       Indented rows are children of the row above. Totals are\n"
+               "               marked '=' and preceded by a divider line. \"of which\"\n"
+               "               rows re-slice the total above (not added to it).\n"
+               "\n"
+               "  Required vs avoidable (rows in the per-call decomposition):\n"
+               "    REQUIRED   inner session.Run, sampling, other, outside RunPipeline\n"
+               "               (cannot be removed without breaking output)\n"
+               "    AVOIDABLE  in-RunPipeline orchestration\n"
+               "               (pipeline-mode-only: per-stage rebind, ortvalue_store_\n"
+               "               lookups, HasInput/HasOutput scans, cross-stage forwarding)\n"
+               "\n"
+               "  \"other\" content per phase (wall clock minus state_->Run minus sampling):\n"
+               "    PREFILL    AllocateInputIdsOnDevice, search_->AppendTokens,\n"
+               "               ComputeLogits epilogue (SetLogits, optional\n"
+               "               guidance.CommitTokens / GetFFTokens fast-forward).\n"
+               "    DECODE     ComputeLogits epilogue (SetLogits, optional\n"
+               "               guidance fast-forward), optional guidance.ProcessLogits,\n"
+               "               ApplyMinLength, ApplyRepetitionPenalty, validation.\n"
+               "               These per-token search ops are why DECODE \"other\" is\n"
+               "               larger per call than PREFILL \"other\".\n"
+               "\n"
+               "  Per-stage <-> per-call <-> per-chunk:\n"
+               "    inner session.Run        = inner    * stages/Run     [per call]\n"
+               "    in-RunPipeline orch.     = (setup + teardown) * stages/Run\n"
+               "    per-chunk RunPipeline    = (setup + inner + teardown) * stages/chunk\n"
+               "    The inline equations on each row above use these identities to tie\n"
+               "    per-call totals back to the per-stage averages.\n"
+               "\n"
+               "  Caveats:\n"
+               "    * chunks/Run and stages/Run are per State::Run() invocation. They equal\n"
+               "      per-Generator-call values when each AppendTokens / GenerateNextToken\n"
+               "      triggers exactly one State::Run (the rare exception is the guidance\n"
+               "      fast-forward path that fires a 2nd state_->Run inside one\n"
+               "      AppendTokens call).\n"
+               "    * PREFILL Wall clock measures Generator::AppendTokens. The benchmark\n"
+               "      wraps Generator::AppendTokenSequences which additionally calls\n"
+               "      Generators::PadInputs, so this number can be a few microseconds below\n"
+               "      the benchmark Prompt processing total.\n"
                "================================================================================\n");
   std::fflush(stderr);
 }
