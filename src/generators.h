@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include "filesystem.h"
 #include <functional>
@@ -98,6 +99,7 @@ struct GeneratorParams : std::enable_shared_from_this<GeneratorParams>, LeakChec
 
 struct Generator : LeakChecked<Generator> {
   Generator(const Model& model, const GeneratorParams& params);
+  ~Generator();
 
   bool IsDone();
   size_t TokenCount() const;
@@ -130,6 +132,27 @@ struct Generator : LeakChecked<Generator> {
                 generated,  // Set after GenerateNextToken
                 rewound };  // Set after RewindToLength
   Action last_action_{standard};
+
+  // Generator-level overhead profiling. Same env var as the State-level
+  // DecoderOnlyPipelineState profiler (ORTGENAI_PIPELINE_OVERHEAD_PROFILE=1).
+  // When enabled, AppendTokens and GenerateNextToken are timed end-to-end and
+  // their internal ComputeLogits / sampling sub-blocks are bucketed separately.
+  // The destructor prints a summary in which:
+  //   AppendTokens.total_ns                       == benchmark "Prompt processing (TTFT)"
+  //   GenerateNextToken.with_logits.total_ns      == benchmark "Token generation"
+  //   GenerateNextToken.sample_only.total_ns      == benchmark "Token sampling"
+  // and within each call, total = compute_logits + sampling + other so the
+  // per-call decomposition explains exactly where every microsecond is spent.
+  bool overhead_profile_enabled_{false};
+  struct GenStats {
+    uint64_t calls{};
+    uint64_t total_ns{};           // whole call wall clock
+    uint64_t compute_logits_ns{};  // time inside ComputeLogits() sub-call (includes state_->Run)
+    uint64_t sampling_ns{};        // time inside the sampling block (SelectTop / SampleTopK / SampleTopP)
+  };
+  GenStats append_tokens_stats_{};                        // 1 per generation (TTFT path)
+  GenStats generate_next_token_with_logits_stats_{};      // decode steps that include ComputeLogits
+  GenStats generate_next_token_sample_only_stats_{};      // first GenerateNextToken after AppendTokens (sampling only)
 };
 
 struct OrtGlobals {

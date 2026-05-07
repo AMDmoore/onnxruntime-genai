@@ -11,6 +11,7 @@
 #include "models/model.h"
 #include "models/model_type.h"
 #include "models/decoder_only.h"
+#include "models/decoder_only_pipeline.h"
 #include "constrained_logits_processor.h"
 #include "search.h"
 #include "tracing.h"
@@ -23,6 +24,9 @@
 #include "ryzenai/interface.h"
 #include "morphizen_ep/interface.h"
 #include "engine/engine.h"
+
+#include <chrono>
+#include <cstdio>
 
 #if defined(_WIN32)
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
@@ -51,6 +55,16 @@ void ThrowErrorIfSessionTerminated(bool is_session_terminated) {
 }
 
 namespace Generators {
+
+namespace {
+// Monotonic clock used by the Generator-level overhead profiler. Mirrors the
+// helper in decoder_only_pipeline.cpp.
+using GenProfileClock = std::chrono::steady_clock;
+
+inline uint64_t GenNsBetween(GenProfileClock::time_point a, GenProfileClock::time_point b) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
+}  // namespace
 
 static bool _ = (Ort::InitApi(), false);
 
@@ -354,6 +368,10 @@ std::unique_ptr<Search> CreateSearch(const GeneratorParams& params) {
 }
 
 Generator::Generator(const Model& model, const GeneratorParams& params) : model_{model.shared_from_this()} {
+  // Same gate as the State-level profiler so a single env var enables both
+  // and the two reports compose into a full top-to-bottom view.
+  GetEnv("ORTGENAI_PIPELINE_OVERHEAD_PROFILE", overhead_profile_enabled_);
+
   // RNNT models don't use the traditional search/logits pipeline,
   // so skip the standard validations and just create the state.
   if (ModelType::IsRNNT(model.config_->model.type)) {
@@ -373,6 +391,315 @@ Generator::Generator(const Model& model, const GeneratorParams& params) : model_
   search_ = CreateSearch(params);
   state_ = model.CreateState(search_->GetSequenceLengths(), params);    // Search sequence lengths set when creating state
   guidance_logits_processor_ = CreateGuidanceLogitsProcessor(*state_);  // Could be nullptr if use_guidance (constrained decoding) is not used
+}
+
+Generator::~Generator() {
+  if (!overhead_profile_enabled_) {
+    return;
+  }
+  if (append_tokens_stats_.calls == 0 &&
+      generate_next_token_with_logits_stats_.calls == 0 &&
+      generate_next_token_sample_only_stats_.calls == 0) {
+    return;
+  }
+
+  // ---- Helpers -------------------------------------------------------------
+  // Pretty-print non-negative microsecond values with thousands separators
+  // and 2 decimal places, right-aligned in a fixed width so columns line up.
+  auto fmt_us = [](double us, int width) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", us < 0.0 ? 0.0 : us);
+    std::string s = buf;
+    size_t dot = s.find('.');
+    if (dot == std::string::npos) dot = s.size();
+    for (int i = static_cast<int>(dot) - 3; i > 0; i -= 3) {
+      s.insert(static_cast<size_t>(i), ",");
+    }
+    if (static_cast<int>(s.size()) < width) {
+      s.insert(0, static_cast<size_t>(width) - s.size(), ' ');
+    }
+    return s;
+  };
+  auto fmt_pct = [](double num, double den) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%6.2f", den > 0.0 ? (num / den) * 100.0 : 0.0);
+    return std::string(buf);
+  };
+  // Section banner sized to match the 80-char ==== separator below.
+  // Layout: "+---- " (6) + title + " " (1) + dashes + "+" (1) == 80 chars
+  //   => dashes_len = 72 - len(title)
+  auto print_section_header = [](const char* title) {
+    const int dashes_len = std::max(0, 72 - static_cast<int>(std::strlen(title)));
+    const std::string dashes(static_cast<size_t>(dashes_len), '-');
+    std::fprintf(stderr, "\n+---- %s %s+\n", title, dashes.c_str());
+  };
+  // Hierarchical breakdown row for the per-call decomposition table. The label
+  // column is wide enough (62 chars) to accommodate the longest label without
+  // breaking alignment.
+  auto row = [&](const char* prefix, const char* label, double us_per_call,
+                 double total_us_per_call, const char* note) {
+    std::fprintf(stderr,
+                 "  %-4s %-62s %s us  (%s %%)%s%s\n",
+                 prefix,
+                 label,
+                 fmt_us(us_per_call, 14).c_str(),
+                 fmt_pct(us_per_call, total_us_per_call).c_str(),
+                 (note && note[0]) ? "  " : "",
+                 note ? note : "");
+  };
+
+  // ---- Pull State stats if available, then suppress its own destructor print
+  DecoderOnlyPipelineState* pipe_state = dynamic_cast<DecoderOnlyPipelineState*>(state_.get());
+  DecoderOnlyPipelineState::OverheadStats empty_state_stats{};
+  const auto& state_prefill = pipe_state ? pipe_state->GetPrefillOverheadStats() : empty_state_stats;
+  const auto& state_decode = pipe_state ? pipe_state->GetDecodeOverheadStats() : empty_state_stats;
+  if (pipe_state) {
+    pipe_state->SuppressOverheadDestructorReport();
+  }
+
+  // ---- Per-phase printer ---------------------------------------------------
+  auto print_phase = [&](const char* phase_title,
+                         const char* call_label,
+                         const char* benchmark_ref,
+                         const char* other_row_label,
+                         const GenStats& gen_stats,
+                         const DecoderOnlyPipelineState::OverheadStats* state_stats) {
+    if (gen_stats.calls == 0) return;
+
+    const double calls = static_cast<double>(gen_stats.calls);
+    const double gen_total_us = (gen_stats.total_ns / 1000.0) / calls;
+    const double gen_sampling_us = (gen_stats.sampling_ns / 1000.0) / calls;
+
+    const bool have_state =
+        state_stats != nullptr && state_stats->runs > 0 && state_stats->stages > 0;
+    const double state_runs = have_state ? static_cast<double>(state_stats->runs) : 0.0;
+    const double state_stages = have_state ? static_cast<double>(state_stats->stages) : 0.0;
+    const double state_steps = have_state ? static_cast<double>(state_stats->steps) : 0.0;
+    const double state_full_us =
+        have_state
+            ? (state_stats->setup_ns + state_stats->inner_run_ns +
+               state_stats->teardown_ns + state_stats->outer_ns) / 1000.0 / state_runs
+            : 0.0;
+    const double state_inner_us =
+        have_state ? (state_stats->inner_run_ns / 1000.0) / state_runs : 0.0;
+    const double state_orch_us =
+        have_state ? ((state_stats->setup_ns + state_stats->teardown_ns) / 1000.0) / state_runs : 0.0;
+    const double state_outer_us =
+        have_state ? (state_stats->outer_ns / 1000.0) / state_runs : 0.0;
+    const double chunks_per_run = (have_state && state_runs > 0.0) ? state_steps / state_runs : 0.0;
+    const double stages_per_run = (have_state && state_runs > 0.0) ? state_stages / state_runs : 0.0;
+
+    const double per_stage_setup_us =
+        have_state ? (state_stats->setup_ns / 1000.0) / state_stages : 0.0;
+    const double per_stage_inner_us =
+        have_state ? (state_stats->inner_run_ns / 1000.0) / state_stages : 0.0;
+    const double per_stage_teardown_us =
+        have_state ? (state_stats->teardown_ns / 1000.0) / state_stages : 0.0;
+
+    // Generator scaffolding = everything Generator does outside state_->Run.
+    // Reference State.full_run rather than Generator.compute_logits so the
+    // tiny ComputeLogits epilogue (SetLogits + guidance) lands in "other" too.
+    const double gen_scaffolding_us =
+        have_state ? std::max(0.0, gen_total_us - state_full_us) : 0.0;
+    const double gen_other_us = std::max(0.0, gen_scaffolding_us - gen_sampling_us);
+
+    // OGA-side overhead = everything except the actual session.Run kernel time.
+    const double oga_overhead_us =
+        have_state ? std::max(0.0, gen_total_us - state_inner_us) : 0.0;
+
+    // ---- Print
+    print_section_header(phase_title);
+    std::fprintf(stderr, "  %s\n", call_label);
+    std::fprintf(stderr, "  Calls: %llu", static_cast<unsigned long long>(gen_stats.calls));
+    if (have_state) {
+      std::fprintf(stderr, "   |   chunks/Run: %.2f   |   stages/Run: %.2f",
+                   chunks_per_run, stages_per_run);
+    }
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr,
+                 "  Wall clock per call: %s us  (%.2f ms)   <- compare to benchmark \"%s\"\n",
+                 fmt_us(gen_total_us, 14).c_str(), gen_total_us / 1000.0, benchmark_ref);
+    std::fprintf(stderr, "\n  Decomposition (sums to wall clock above):\n");
+
+    if (have_state) {
+      row("*",  "inner session.Run (ORT model compute)", state_inner_us, gen_total_us,
+          "<- irreducible ORT compute (model kernel time)");
+      row(".",  "Generator scaffolding (outside State::Run)", gen_scaffolding_us, gen_total_us, "");
+      row(" \\-", "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us,
+          "[required: picks next token from logits]");
+      row(" \\-", other_row_label, gen_other_us, gen_total_us,
+          "[required functional work; see Notes]");
+      row(".",  "in-RunPipeline orchestration (rebind across stages)",
+          state_orch_us, gen_total_us,
+          "[pipeline-mode only: rebind + cross-stage output forwarding]");
+      row(".",  "outside RunPipeline (UpdateIO + chunk-slide + cleanup)",
+          state_outer_us, gen_total_us,
+          "[mostly required: KV/positions/mask update]");
+      std::fprintf(stderr,
+                   "  ---------------------------------------------------------------------------\n"
+                   "  Total CPU time outside inner session.Run:\n"
+                   "  %s us  (%s %% of wall clock)\n"
+                   "  -- mix of REQUIRED functional work (sampling, per-token search ops,\n"
+                   "     guidance, KV/mask update) and AVOIDABLE orchestration overhead\n"
+                   "     (per-stage rebinds, ortvalue_store_ lookups). See Notes below.\n",
+                   fmt_us(oga_overhead_us, 14).c_str(),
+                   fmt_pct(oga_overhead_us, gen_total_us).c_str());
+      // Per-stage average inside RunPipeline. The "stages/chunk" multiplier
+      // makes the relationship to per-chunk wall clock explicit:
+      //   per-chunk RunPipeline = (setup + inner + teardown) * stages/chunk
+      const double stages_per_chunk =
+          state_stats->steps > 0 ? state_stages / state_steps : 0.0;
+      std::fprintf(stderr,
+                   "\n"
+                   "  In-RunPipeline per-stage avg (n=%llu stages, %.2f stage/chunk):\n"
+                   "      setup %s + inner %s + teardown %s us\n"
+                   "      => per-chunk RunPipeline = (setup+inner+teardown) * stages/chunk\n",
+                   static_cast<unsigned long long>(state_stats->stages),
+                   stages_per_chunk,
+                   fmt_us(per_stage_setup_us, 0).c_str(),
+                   fmt_us(per_stage_inner_us, 0).c_str(),
+                   fmt_us(per_stage_teardown_us, 0).c_str());
+
+      // Per-chunk breakdown -- only meaningful when the chunk loop runs
+      // multiple times (sliding-window prefill). For decode (1 chunk/call)
+      // the per-chunk number is identical to the wall-clock-per-call line
+      // already printed above, so we skip it.
+      if (chunks_per_run > 1.0 && state_stats->steps > 0) {
+        const double per_chunk_total_us =
+            (state_stats->chunk_loop_body_ns / 1000.0) / static_cast<double>(state_stats->steps);
+        // RunPipeline portion per chunk = total RunPipeline time across the phase
+        // divided by the number of chunks (== number of RunPipeline calls).
+        const double per_chunk_runpipeline_us =
+            ((state_stats->setup_ns + state_stats->inner_run_ns + state_stats->teardown_ns) /
+             1000.0) /
+            static_cast<double>(state_stats->steps);
+        // Slide block runs (steps - runs) times total: once per chunk EXCEPT the
+        // last chunk of each Run. Average per actual slide invocation.
+        const uint64_t total_slides =
+            state_stats->steps > state_stats->runs ? state_stats->steps - state_stats->runs : 0;
+        const double slide_total_us =
+            std::max(0.0,
+                     (per_chunk_total_us - per_chunk_runpipeline_us) *
+                         static_cast<double>(state_stats->steps));
+        const double per_slide_us =
+            total_slides > 0 ? slide_total_us / static_cast<double>(total_slides) : 0.0;
+        const unsigned long long slides_per_run =
+            static_cast<unsigned long long>(total_slides / std::max<uint64_t>(1, state_stats->runs));
+        char slide_note[64];
+        std::snprintf(slide_note, sizeof(slide_note), "[runs %llu times per Run() call]", slides_per_run);
+
+        std::fprintf(stderr,
+                     "\n  Per-chunk wall clock (n=%llu chunks across %llu Run() calls):\n",
+                     static_cast<unsigned long long>(state_stats->steps),
+                     static_cast<unsigned long long>(state_stats->runs));
+        row("*", "inner + orchestration (one RunPipeline per chunk)",
+            per_chunk_runpipeline_us, per_chunk_total_us, "");
+        row(".", "between-chunk slide (KV / positions / logits Update)",
+            per_slide_us, per_chunk_total_us, slide_note);
+        std::fprintf(stderr,
+                     "  -----------------------------------------------------------"
+                     "-----------------------------------\n");
+        row(" ", "per-chunk wall clock", per_chunk_total_us, per_chunk_total_us, "");
+      }
+    } else {
+      // No State data: degraded view from Generator stats only.
+      const double gen_cl_us = (gen_stats.compute_logits_ns / 1000.0) / calls;
+      const double gen_other_only_us = std::max(0.0, gen_total_us - gen_cl_us - gen_sampling_us);
+      row("*",  "ComputeLogits (state_->Run)", gen_cl_us, gen_total_us,
+          "<- model + State scaffolding (lumped)");
+      row(".",  "sampling (SelectTop / Sample*)", gen_sampling_us, gen_total_us, "");
+      row(".",  "other (search ops, validation, guidance)", gen_other_only_us, gen_total_us, "");
+      std::fprintf(stderr,
+                   "  Note: detailed State::Run breakdown unavailable for this State type.\n");
+    }
+  };
+
+  std::fprintf(stderr,
+               "\n"
+               "================================================================================\n"
+               "[OGA profile] Per-call CPU breakdown summary\n"
+               "              (gated by ORTGENAI_PIPELINE_OVERHEAD_PROFILE=1)\n"
+               "================================================================================\n");
+
+  print_phase("PREFILL  (prompt processing)",
+              "AppendTokens()  -- one call per prompt batch",
+              "Prompt processing (time to first token): avg (us)",
+              "other (input alloc + search.Append + SetLogits; once/call)",
+              append_tokens_stats_,
+              pipe_state ? &state_prefill : nullptr);
+
+  print_phase("DECODE  (token generation)",
+              "GenerateNextToken()  -- ComputeLogits then sample, repeated per token",
+              "Token generation: avg (us)",
+              "other (per-token: MinLen + RepPen + guidance + SetLogits)",
+              generate_next_token_with_logits_stats_,
+              pipe_state ? &state_decode : nullptr);
+
+  // Sampling-only is special: this is the very first GenerateNextToken call
+  // after AppendTokens. Logits were already computed during prefill, so this
+  // call only samples -- no ComputeLogits / state_->Run happens here, hence
+  // there is never State data to attach.
+  if (generate_next_token_sample_only_stats_.calls > 0) {
+    const double calls = static_cast<double>(generate_next_token_sample_only_stats_.calls);
+    const double total_us = (generate_next_token_sample_only_stats_.total_ns / 1000.0) / calls;
+    const double samp_us = (generate_next_token_sample_only_stats_.sampling_ns / 1000.0) / calls;
+    const double other_us = std::max(0.0, total_us - samp_us);
+    print_section_header("FIRST-TOKEN SAMPLING (no ComputeLogits)");
+    std::fprintf(stderr,
+                 "  GenerateNextToken()  -- 1st call after AppendTokens (logits already computed)\n"
+                 "  Calls: %llu\n"
+                 "  Wall clock per call: %s us   <- compare to benchmark \"Token sampling: avg (us)\"\n"
+                 "      sampling (SelectTop / Sample*): %s us  (%s %%)\n"
+                 "      other:                          %s us  (%s %%)\n",
+                 static_cast<unsigned long long>(generate_next_token_sample_only_stats_.calls),
+                 fmt_us(total_us, 0).c_str(),
+                 fmt_us(samp_us, 0).c_str(),
+                 fmt_pct(samp_us, total_us).c_str(),
+                 fmt_us(other_us, 0).c_str(),
+                 fmt_pct(other_us, total_us).c_str());
+  }
+
+  std::fprintf(stderr,
+               "\nNotes:\n"
+               "  * \"inner session.Run\" is the actual ONNX Runtime model compute on the EP.\n"
+               "    All other rows above are CPU work that lives outside the model kernel,\n"
+               "    but they are NOT all \"overhead\" in the avoidable sense:\n"
+               "      REQUIRED (cannot be removed without breaking output):\n"
+               "         - sampling (SelectTop / Sample*)        -- picks next token\n"
+               "         - \"other\" row (per-phase, see below)    -- search ops, guidance, alloc\n"
+               "         - chunk-slide (KV / positions / logits) -- sliding-window correctness\n"
+               "      AVOIDABLE (genuine orchestration overhead specific to pipeline mode):\n"
+               "         - in-RunPipeline orchestration          -- per-stage I/O rebind,\n"
+               "                                                    ortvalue_store_ lookups,\n"
+               "                                                    HasInput/HasOutput scans\n"
+               "         - small bookkeeping inside outside-RunPipeline (post-loop cleanup)\n"
+               "  * \"other\" expands differently per phase:\n"
+               "      - PREFILL:  per call (once/prompt) -- AllocateInputIdsOnDevice,\n"
+               "                  search_->AppendTokens, ComputeLogits epilogue (SetLogits,\n"
+               "                  optional guidance.CommitTokens / fast-forward tokens).\n"
+               "      - DECODE:   per token -- ApplyMinLength, ApplyRepetitionPenalty,\n"
+               "                  optional guidance.ProcessLogits, ComputeLogits epilogue.\n"
+               "                  These per-token search ops are why DECODE \"other\" is\n"
+               "                  larger per call than PREFILL \"other\".\n"
+               "  * \"In-RunPipeline per-stage avg\" relates to the per-chunk RunPipeline\n"
+               "    row above by exactly the stages/chunk multiplier:\n"
+               "      per-chunk RunPipeline = (setup + inner + teardown) * stages/chunk\n"
+               "    With 1 stage/chunk (typical) the per-chunk number == sum of the three\n"
+               "    per-stage numbers; multi-stage pipelines (e.g. embed + transformer)\n"
+               "    multiply accordingly.\n"
+               "  * chunks/Run and stages/Run are per State::Run() invocation, NOT per\n"
+               "    Generator-level call. They coincide in the normal flow because each\n"
+               "    AppendTokens / GenerateNextToken triggers exactly one State::Run\n"
+               "    (the only exception is the guidance fast-forward path in\n"
+               "    Generator::ComputeLogits, which fires a 2nd state_->Run inside the\n"
+               "    same AppendTokens call -- rare in practice).\n"
+               "  * PREFILL \"Wall clock per call\" measures Generator::AppendTokens only.\n"
+               "    The benchmark wraps Generator::AppendTokenSequences, which also calls\n"
+               "    Generators::PadInputs(). The PadInputs cost is small but not counted\n"
+               "    here, so this number can be a few microseconds below the benchmark\n"
+               "    \"Prompt processing\" total.\n"
+               "================================================================================\n");
+  std::fflush(stderr);
 }
 
 DeviceSpan<int32_t> Generator::AllocateInputIdsOnDevice(cpu_span<const int32_t> input_ids) {
@@ -403,6 +730,12 @@ DeviceSpan<int32_t> Generator::AllocateInputIdsOnDevice(cpu_span<const int32_t> 
 
 void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
   DurationTrace trace{"Generator::AppendTokens"};
+
+  // Bracket the whole AppendTokens call; the inner ComputeLogits call below
+  // is bracketed separately so the destructor report can show
+  // total = compute_logits + other.
+  const auto t_call_start = overhead_profile_enabled_ ? GenProfileClock::now() : GenProfileClock::time_point{};
+  uint64_t call_compute_logits_ns = 0;
 
   ThrowErrorIfSessionTerminated(state_->session_terminated_);
   if (input_ids.size() == 0)
@@ -474,7 +807,21 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
   }
 
   computed_logits_ = false;
-  ComputeLogits(input_ids_device);
+  {
+    const auto t_cl_pre = overhead_profile_enabled_ ? GenProfileClock::now() : GenProfileClock::time_point{};
+    ComputeLogits(input_ids_device);
+    if (overhead_profile_enabled_) {
+      call_compute_logits_ns = GenNsBetween(t_cl_pre, GenProfileClock::now());
+    }
+  }
+
+  if (overhead_profile_enabled_) {
+    const uint64_t total = GenNsBetween(t_call_start, GenProfileClock::now());
+    ++append_tokens_stats_.calls;
+    append_tokens_stats_.total_ns += total;
+    append_tokens_stats_.compute_logits_ns += call_compute_logits_ns;
+    // sampling_ns intentionally not bumped: AppendTokens never samples.
+  }
 }
 
 void Generator::SetInputs(const NamedTensors& named_tensors) {
@@ -598,10 +945,49 @@ void Generator::SetLogits(DeviceSpan<float> logits) {
 void Generator::GenerateNextToken() {
   DurationTrace trace{"Generator::GenerateNextToken"};
 
+  // Profile bracketing. We need an RAII commit because the function has
+  // early returns (RNNT; SelectTop fast path used to return). The bucket
+  // (with-logits vs sampling-only) is decided by the value of
+  // computed_logits_ on ENTRY -- false means this call also runs
+  // ComputeLogits/state_->Run, true means this call only samples.
+  const bool profile = overhead_profile_enabled_;
+  const auto t_call_start = profile ? GenProfileClock::now() : GenProfileClock::time_point{};
+  uint64_t call_compute_logits_ns = 0;
+  uint64_t call_sampling_ns = 0;
+  const bool had_logits_on_entry = computed_logits_;
+
+  struct StatsCommitter {
+    bool enabled;
+    GenStats* with_logits;
+    GenStats* sample_only;
+    bool had_logits_on_entry;
+    const uint64_t* compute_logits_ns;
+    const uint64_t* sampling_ns;
+    GenProfileClock::time_point start;
+    bool cancelled{false};
+    ~StatsCommitter() {
+      if (!enabled || cancelled) return;
+      GenStats& target = had_logits_on_entry ? *sample_only : *with_logits;
+      ++target.calls;
+      target.total_ns += GenNsBetween(start, GenProfileClock::now());
+      target.compute_logits_ns += *compute_logits_ns;
+      target.sampling_ns += *sampling_ns;
+    }
+  };
+  StatsCommitter committer{profile,
+                           &generate_next_token_with_logits_stats_,
+                           &generate_next_token_sample_only_stats_,
+                           had_logits_on_entry,
+                           &call_compute_logits_ns,
+                           &call_sampling_ns,
+                           t_call_start,
+                           false};
+
   ThrowErrorIfSessionTerminated(state_->session_terminated_);
 
   // RNNT models: yield one token per call from the decoder state machine
   if (auto* speech_state = dynamic_cast<NemotronSpeechState*>(state_.get())) {
+    committer.cancelled = true;  // RNNT path is unrelated to TTFT/decode bucketing.
     state_->SetExtraInputs(extra_inputs_);
     extra_inputs_.clear();
     speech_state->StepToken();
@@ -632,7 +1018,11 @@ void Generator::GenerateNextToken() {
     auto next_tokens = search_->GetNextTokens();
     if (last_action_ == Action::rewound)
       search_->AppendTokens(next_tokens);
+    const auto t_cl_pre = profile ? GenProfileClock::now() : GenProfileClock::time_point{};
     ComputeLogits(next_tokens);
+    if (profile) {
+      call_compute_logits_ns = GenNsBetween(t_cl_pre, GenProfileClock::now());
+    }
   }
   if (guidance_logits_processor_) {
     auto logits = GetLogits();
@@ -654,28 +1044,39 @@ void Generator::GenerateNextToken() {
   }
 
   last_action_ = Action::generated;
+
+  // Bracket only the actual sampling op so call_sampling_ns reflects the
+  // time spent in SelectTop / SampleTopK / SampleTopKTopP / SampleTopP.
+  // The branching+validation above is bookkeeping and stays in "other".
+  // Note: the original code had an early "return" on the SelectTop path;
+  // converting that branch to an else preserves identical behaviour
+  // (validation and Sample* calls were already gated on do_sample) while
+  // letting the RAII committer fire on a single exit path.
+  const auto t_sample_pre = profile ? GenProfileClock::now() : GenProfileClock::time_point{};
   if (!search.do_sample || search.top_k == 1 || search.temperature == 0) {
     search_->SelectTop();
-    return;
-  }
-
-  // The user explicitly called TopK_TopP on a beam search
-  if (search.num_beams != 1)
-    throw std::runtime_error("TopK and TopP cannot be used with a beam search");
-
-  // Sanity checks
-  if (search.top_p < 0.0f || search.top_p > 1.0f)
-    throw std::runtime_error("top_p must be between 0.0 and 1.0");
-  if (search.top_k < 0)
-    throw std::runtime_error("top_k must be 0 or greater");
-
-  if (search.top_p > 0.0f && search.top_p < 1.0f && search.top_k > 1) {
-    search_->SampleTopKTopP(search.top_k, search.top_p, search.temperature);
-  } else if (search.top_k > 1) {
-    search_->SampleTopK(search.top_k, search.temperature);
   } else {
-    assert(search.top_k == 0);
-    search_->SampleTopP(search.top_p, search.temperature);
+    // The user explicitly called TopK_TopP on a beam search
+    if (search.num_beams != 1)
+      throw std::runtime_error("TopK and TopP cannot be used with a beam search");
+
+    // Sanity checks
+    if (search.top_p < 0.0f || search.top_p > 1.0f)
+      throw std::runtime_error("top_p must be between 0.0 and 1.0");
+    if (search.top_k < 0)
+      throw std::runtime_error("top_k must be 0 or greater");
+
+    if (search.top_p > 0.0f && search.top_p < 1.0f && search.top_k > 1) {
+      search_->SampleTopKTopP(search.top_k, search.top_p, search.temperature);
+    } else if (search.top_k > 1) {
+      search_->SampleTopK(search.top_k, search.temperature);
+    } else {
+      assert(search.top_k == 0);
+      search_->SampleTopP(search.top_p, search.temperature);
+    }
+  }
+  if (profile) {
+    call_sampling_ns = GenNsBetween(t_sample_pre, GenProfileClock::now());
   }
 }
 

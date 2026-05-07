@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <future>
 #include <optional>
 
@@ -60,6 +61,8 @@ struct DecoderOnlyPipelineState : State {
   DecoderOnlyPipelineState(const DecoderOnlyPipelineState&) = delete;
   DecoderOnlyPipelineState& operator=(const DecoderOnlyPipelineState&) = delete;
 
+  ~DecoderOnlyPipelineState() override;
+
   void SetExtraInputs(const std::vector<ExtraInput>& extra_inputs) override;
 
   DeviceSpan<float> Run(int total_length, DeviceSpan<int32_t>& next_tokens,
@@ -108,6 +111,42 @@ struct DecoderOnlyPipelineState : State {
   std::unique_ptr<PositionInputs> position_inputs_;
   int padded_total_{};  // total_length in padded coordinate system for static-shape models
   ExtraInputs extra_inputs_{*this};
+
+  // Per-stage CPU-overhead profiling for RunPipeline(). See cpp file for the
+  // exact bracketing. Enable by setting ORTGENAI_PIPELINE_OVERHEAD_PROFILE=1.
+  // The Generator destructor reads these via the public accessors below to
+  // produce a single unified per-call breakdown report.
+  bool overhead_profile_enabled_{false};
+  bool suppress_destructor_print_{false};  // Set by Generator when it owns the report.
+ public:
+  struct OverheadStats {
+    uint64_t runs{};          // number of outer Run() invocations in this phase
+    uint64_t steps{};         // number of RunPipeline() invocations (== number of chunks for prefill)
+    uint64_t stages{};        // number of stage iterations that actually executed
+    uint64_t setup_ns{};      // [in RunPipeline] pre-session.Run rebind work
+    uint64_t inner_run_ns{};  // [in RunPipeline] pipeline_state->Run() (the only call OGA must make)
+    uint64_t teardown_ns{};   // [in RunPipeline] post-session.Run forwarding
+    uint64_t outer_ns{};      // [in Run() but OUTSIDE RunPipeline] UpdateInputsOutputs +
+                              // between-chunk slide (input_ids/KV/positions/logits Update) +
+                              // post-loop ortvalue_store cleanup + static-shape mask cleanup.
+                              // Together with setup+inner+teardown this sums to the full Run()
+                              // wall-clock time, so the report covers the whole stage.
+    uint64_t chunk_loop_body_ns{};  // Cumulative time across all iterations of the chunk loop
+                                    // in Run() (one iteration per chunk). Each iteration
+                                    // bracketed contains the RunPipeline call plus the
+                                    // between-chunk slide block (slide runs num_chunks-1
+                                    // times per Run, so per_chunk_slide = (chunk_loop_body
+                                    // - sum_RunPipeline) / (steps - runs) on average).
+                                    // Lets the report show "time cost per chunk" directly.
+  };
+  bool IsOverheadProfileEnabled() const { return overhead_profile_enabled_; }
+  const OverheadStats& GetPrefillOverheadStats() const { return prefill_stats_; }
+  const OverheadStats& GetDecodeOverheadStats() const { return decode_stats_; }
+  void SuppressOverheadDestructorReport() { suppress_destructor_print_ = true; }
+
+ private:
+  OverheadStats prefill_stats_{};  // first_run_ == true
+  OverheadStats decode_stats_{};   // first_run_ == false
 };
 
 }  // namespace Generators

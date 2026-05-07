@@ -5,9 +5,24 @@
 #include "../logging.h"
 #include "../tracing.h"
 #include "decoder_only_pipeline.h"
+#include "env_utils.h"
 #include "windowed_kv_cache.h"
 
+#include <chrono>
+#include <cstdio>
+
 namespace Generators {
+
+namespace {
+// Monotonic clock used by the RunPipeline overhead profiler. We deliberately
+// pick steady_clock (not high_resolution_clock, which is not guaranteed
+// monotonic on Windows) so accumulated deltas can never go negative.
+using ProfileClock = std::chrono::steady_clock;
+
+inline uint64_t NsBetween(ProfileClock::time_point a, ProfileClock::time_point b) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
+}  // namespace
 
 DecoderOnlyPipelineModel::DecoderOnlyPipelineModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
     : Model{std::move(config)}, ort_env_{ort_env} {
@@ -143,6 +158,10 @@ DecoderOnlyPipelineState::DecoderOnlyPipelineState(const DecoderOnlyPipelineMode
       do_key_value_cache_partial_update_{key_value_cache_ && key_value_cache_->IsPartialUpdateSupported()},
       recurrent_state_{CreateRecurrentState(*this)},
       position_inputs_{CreatePositionInputs(*this, sequence_lengths, model_.config_->model.decoder.inputs.attention_mask)} {
+  // Opt-in CPU-overhead profiler. See decoder_only_pipeline.h for what each
+  // bucket measures. Cost when disabled is a single bool check per stage.
+  GetEnv("ORTGENAI_PIPELINE_OVERHEAD_PROFILE", overhead_profile_enabled_);
+
   input_ids_->Add();
   position_inputs_->Add();
   logits_.Add();
@@ -218,6 +237,82 @@ DecoderOnlyPipelineState::DecoderOnlyPipelineState(const DecoderOnlyPipelineMode
   }
 }
 
+DecoderOnlyPipelineState::~DecoderOnlyPipelineState() {
+  if (!overhead_profile_enabled_) {
+    return;
+  }
+  if (suppress_destructor_print_) {
+    // Generator owns the unified report; nothing to print here.
+    return;
+  }
+  if (prefill_stats_.stages == 0 && decode_stats_.stages == 0) {
+    return;
+  }
+
+  // Print one line per phase. Times are reported per stage iteration so the
+  // ratio is comparable across configs with different num_chunks/num_stages.
+  // overhead = setup + teardown (the per-call rebind/forwarding work);
+  // total    = setup + inner + teardown (everything inside the stage body).
+  // Use stderr + fprintf to avoid interleaving with std::cout token streams
+  // and to be safe in a destructor.
+  auto print_phase = [](const char* label, const OverheadStats& s) {
+    if (s.stages == 0 && s.runs == 0) {
+      std::fprintf(stderr, "[OGA pipeline overhead] %s: 0 runs, 0 steps, 0 stages\n", label);
+      return;
+    }
+    const double stages = static_cast<double>(s.stages);
+    // Per-stage averages (inside RunPipeline only).
+    const double setup_us = stages > 0.0 ? (s.setup_ns / 1000.0) / stages : 0.0;
+    const double inner_us = stages > 0.0 ? (s.inner_run_ns / 1000.0) / stages : 0.0;
+    const double teardown_us = stages > 0.0 ? (s.teardown_ns / 1000.0) / stages : 0.0;
+    const double stage_total_us = setup_us + inner_us + teardown_us;
+    const double stage_overhead_us = setup_us + teardown_us;
+    const double stage_ratio_pct = stage_total_us > 0.0 ? (stage_overhead_us / stage_total_us) * 100.0 : 0.0;
+
+    const double runs = static_cast<double>(s.runs);
+    const double steps = static_cast<double>(s.steps);
+    const double chunks_per_run = runs > 0.0 ? steps / runs : 0.0;  // == num_chunks for sliding-window prefill
+    const double stages_per_run = runs > 0.0 ? stages / runs : 0.0;
+
+    // Per-Run() rollup: sum the stage measurements across chunks, then add
+    // the outer_ns bucket (UpdateInputsOutputs + chunk slide + post-cleanup).
+    // Together these cover the WHOLE Run() wall clock, so the totals here
+    // should match the benchmark's per-token / per-prefill numbers.
+    const double rp_inner_per_run_us = inner_us * stages_per_run;
+    const double rp_orchestration_per_run_us = stage_overhead_us * stages_per_run;
+    const double outer_per_run_us = runs > 0.0 ? (s.outer_ns / 1000.0) / runs : 0.0;
+    const double full_run_us = rp_inner_per_run_us + rp_orchestration_per_run_us + outer_per_run_us;
+    const double oga_overhead_per_run_us = rp_orchestration_per_run_us + outer_per_run_us;
+    const double full_overhead_ratio_pct = full_run_us > 0.0 ? (oga_overhead_per_run_us / full_run_us) * 100.0 : 0.0;
+
+    std::fprintf(stderr,
+                 "[OGA pipeline overhead] %s: %llu runs, %llu steps (%.2f chunks/run), %llu stages (%.2f stages/run)\n"
+                 "    [in RunPipeline] per stage:  setup %8.2f us + inner %8.2f us + teardown %8.2f us = %8.2f us\n"
+                 "                     in-RunPipeline overhead ratio (setup+teardown)/stage_total: %6.2f%%\n"
+                 "    per Run() WHOLE-STAGE breakdown (covers full Run() wall clock):\n"
+                 "        RunPipeline x %.2f chunks: inner %10.2f us  + orchestration %8.2f us\n"
+                 "        outside RunPipeline      :                   %10.2f us  (UpdateIO + chunk slide + post-cleanup)\n"
+                 "        ---------------------------------------------------------------------------\n"
+                 "        full Run() total         :                   %10.2f us\n"
+                 "        OGA-side overhead (orchestration + outside)  %10.2f us  = %6.2f%% of full Run()\n",
+                 label,
+                 static_cast<unsigned long long>(s.runs),
+                 static_cast<unsigned long long>(s.steps), chunks_per_run,
+                 static_cast<unsigned long long>(s.stages), stages_per_run,
+                 setup_us, inner_us, teardown_us, stage_total_us,
+                 stage_ratio_pct,
+                 chunks_per_run, rp_inner_per_run_us, rp_orchestration_per_run_us,
+                 outer_per_run_us,
+                 full_run_us,
+                 oga_overhead_per_run_us, full_overhead_ratio_pct);
+  };
+
+  std::fprintf(stderr, "\n[OGA pipeline overhead] DecoderOnlyPipelineState summary\n");
+  print_phase("prefill", prefill_stats_);
+  print_phase("decode ", decode_stats_);
+  std::fflush(stderr);
+}
+
 void DecoderOnlyPipelineState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs) {
   for (auto& session : model_.sessions_) {
     extra_inputs_.Add(extra_inputs, session->GetInputNames());
@@ -226,6 +321,16 @@ void DecoderOnlyPipelineState::SetExtraInputs(const std::vector<ExtraInput>& ext
 
 void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>& next_tokens,
                                            DeviceSpan<int32_t> next_indices, bool is_last_chunk) {
+  // Bump per-step counters once per call, regardless of how many stages survive
+  // the run_on_prompt / is_lm_head / run_on_token_gen filters below.
+  if (overhead_profile_enabled_) {
+    if (first_run_) {
+      ++prefill_stats_.steps;
+    } else {
+      ++decode_stats_.steps;
+    }
+  }
+
   for (auto& pipeline_state : pipeline_states_) {
     if (first_run_ && !model_.config_->model.decoder.pipeline[pipeline_state->id_].run_on_prompt) {
       continue;
@@ -234,6 +339,12 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
     } else if (!first_run_ && !model_.config_->model.decoder.pipeline[pipeline_state->id_].run_on_token_gen) {
       continue;
     }
+
+    // t0 is taken AFTER the filter so the unconditional MakeString allocation
+    // for DurationTrace and the rest of the per-stage rebind work below are
+    // included in the "setup" bucket, matching the analysis. Stages that
+    // continue out above are not charged any cost.
+    const auto t0 = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
 
     DurationTrace trace{MakeString("DecoderOnlyPipelineState::RunPipeline[", pipeline_state->id_, "]")};
 
@@ -341,7 +452,9 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
     }
 
     // Run the intermediate pipeline state
+    const auto t1 = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
     pipeline_state->Run(total_length, next_tokens, next_indices);
+    const auto t2 = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
 
     // If there is any partial KV cache update to start, enqueue it.
     if (partial_kv_cache_update_record) {
@@ -370,12 +483,28 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
       }
     }
 
+    if (overhead_profile_enabled_) {
+      const auto t3 = ProfileClock::now();
+      auto& stats = first_run_ ? prefill_stats_ : decode_stats_;
+      ++stats.stages;
+      stats.setup_ns += NsBetween(t0, t1);
+      stats.inner_run_ns += NsBetween(t1, t2);
+      stats.teardown_ns += NsBetween(t2, t3);
+    }
   }
 }
 
 DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int32_t>& next_tokens,
                                                 DeviceSpan<int32_t> next_indices) {
   DurationTrace trace{"DecoderOnlyPipelineState::Run"};
+
+  // Bracket the WHOLE Run() so we can attribute everything not inside
+  // RunPipeline() (UpdateInputsOutputs, between-chunk slide, post-loop
+  // cleanup) to an "outer" bucket. Without this, the per-Run total would
+  // miss work that the OGA-side State path does on every step.
+  const auto t_run_start = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
+  uint64_t run_pipeline_total_ns_local = 0;
+  uint64_t chunk_loop_body_ns_local = 0;
 
   UpdateInputsOutputs(next_tokens, next_indices, total_length);
 
@@ -390,8 +519,34 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
     num_chunks = (next_tokens.size() + window_size - 1) / window_size;
   }
 
+  // Capture the phase BEFORE the chunk loop runs (and before first_run_ is
+  // flipped to false at the bottom of Run()) so the post-loop accounting
+  // attributes the outer time to the correct bucket.
+  const bool profile_phase_is_prefill = first_run_;
+
+  // Count outer Run() invocations per phase so the report can show
+  // chunks/run = steps/runs (1.0 for non-chunked prefill or decode,
+  // > 1.0 when sliding-window chunking multiplies the rebind tax).
+  if (overhead_profile_enabled_) {
+    if (profile_phase_is_prefill) {
+      ++prefill_stats_.runs;
+    } else {
+      ++decode_stats_.runs;
+    }
+  }
+
   for (size_t i = 0; i < num_chunks; ++i) {
+    // t_chunk_pre brackets the WHOLE per-chunk iteration body (RunPipeline +
+    // between-chunk slide). Lets the report attribute per-chunk wall clock
+    // independently of UpdateInputsOutputs/post-loop work which happen
+    // once per Run() and live in outer_ns instead.
+    const auto t_chunk_pre = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
+
+    const auto t_rp_pre = overhead_profile_enabled_ ? ProfileClock::now() : ProfileClock::time_point{};
     RunPipeline(total_length, next_tokens, next_indices, (i == num_chunks - 1));
+    if (overhead_profile_enabled_) {
+      run_pipeline_total_ns_local += NsBetween(t_rp_pre, ProfileClock::now());
+    }
 
     if (model_.config_->model.decoder.sliding_window.has_value() && i < num_chunks - 1) {
       // Sliding the window over the input_ids, key_cache, and value_cache, position_ids, and attention_mask
@@ -400,6 +555,10 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
       position_inputs_->Update(next_tokens, total_length, static_cast<int>(input_ids_->GetShape()[1]));
       logits_.Update(WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get()),
                      static_cast<int>(input_ids_->GetShape()[1]));
+    }
+
+    if (overhead_profile_enabled_) {
+      chunk_loop_body_ns_local += NsBetween(t_chunk_pre, ProfileClock::now());
     }
   }
 
@@ -437,6 +596,20 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
   const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
   if (first_run_ && fixed_len > 0 && total_length < padded_total_) {
     position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
+  }
+
+  // Charge everything in Run() that wasn't inside RunPipeline() to outer_ns.
+  // This is what makes the report cover the WHOLE prefill / decode stage:
+  // setup + inner + teardown + outer == full Run() wall clock.
+  if (overhead_profile_enabled_) {
+    const uint64_t total_run_ns = NsBetween(t_run_start, ProfileClock::now());
+    auto& stats = profile_phase_is_prefill ? prefill_stats_ : decode_stats_;
+    // Guard against measurement drift in case clock skew causes the
+    // bracketed inner sum to slightly exceed the outer measurement.
+    stats.outer_ns += (total_run_ns > run_pipeline_total_ns_local)
+                          ? (total_run_ns - run_pipeline_total_ns_local)
+                          : 0;
+    stats.chunk_loop_body_ns += chunk_loop_body_ns_local;
   }
 
   first_run_ = false;
