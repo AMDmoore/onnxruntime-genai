@@ -60,6 +60,31 @@ bool IntermediatePipelineState::SupportsPrimaryDevice() const {
       // cuda is not listed as one of the providers. This session does not support the cuda device type.
       return false;
     }
+  } else if (model_.p_device_->GetType() == DeviceType::DML) {
+    if (!model_.config_->model.decoder.pipeline[id_].session_options.has_value()) {
+      return true;
+    } else if (auto& provider_options = (*model_.config_->model.decoder.pipeline[id_].session_options).provider_options;
+               std::any_of(provider_options.begin(), provider_options.end(),
+                           [](const Config::ProviderOptions& elem) { return elem.name == "DML"; })) {
+      return true;
+    } else {
+      return false;
+    }
+  } else if (model_.p_device_->GetType() == DeviceType::MorphiZenEP) {
+    if (!model_.config_->model.decoder.pipeline[id_].session_options.has_value()) {
+      return true;
+    } else if (auto& provider_options = (*model_.config_->model.decoder.pipeline[id_].session_options).provider_options;
+               std::any_of(provider_options.begin(), provider_options.end(),
+                           [](const Config::ProviderOptions& elem) { return elem.name == "MorphiZenEP"; })) {
+      return true;
+    } else {
+      // Scenario: VLM pipeline where the embedding sub-model runs on
+      // CPU EP (session_options: {}).
+      // For MorphiZenEP, p_device_inputs_ defaults to CPU, so managed
+      // inputs (input_ids, etc.) reside in CPU memory. MorphiZenEP can
+      // also access CPU memory, so the sub-model is compatible.
+      return model_.p_device_inputs_->GetType() == DeviceType::CPU;
+    }
   }
 
   return false;
@@ -344,6 +369,7 @@ void DecoderOnlyPipelineState::RunPipeline(int total_length, DeviceSpan<int32_t>
         }
       }
     }
+
   }
 }
 
@@ -355,10 +381,12 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
 
   // first_run_ should be thought of as prompt_processing_run_.
   // It is true only for the prompt processing part when the provided tokens are more than 1.
-  first_run_ = next_tokens.size() > 1;
+  // Use padded shape (from input_ids_) so the chunked sliding-window path sees
+  // window_size > 1 even on the last chunk.
+  first_run_ = static_cast<size_t>(input_ids_->GetShape()[1]) > 1;
   size_t num_chunks{1};
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value()) {
-    int window_size = model_.config_->model.decoder.sliding_window->window_size;
+    const int window_size = model_.config_->model.decoder.sliding_window->window_size;
     num_chunks = (next_tokens.size() + window_size - 1) / window_size;
   }
 
@@ -388,6 +416,29 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
     }
   }
 
+  // Last-prefill-chunk pad cleanup (alignment="left") is handled by
+  // WindowedPositionInputs::Update itself via a two-phase defer/consume
+  // pair: DeferLastChunkPadClearLeft records the pad count at the end of
+  // the last prefill Update(), and ConsumeDeferredPadClearLeft zeros the
+  // mask cells at the TOP of the NEXT Update() call -- which may be a
+  // decode step OR the chunk-0 init of a subsequent AppendTokens() batch
+  // (chat mode's system-then-user flow). Either way the consume runs AFTER
+  // the last prefill Run() has completed, so total_sequence_length on that
+  // Run() still equals window_size*num_windows (GQA places K/V at the
+  // correct past_seq = forward_offset - window_size slot). No explicit
+  // post-prefill hook is needed here.
+
+  // [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape path. When
+  // fixed_prompt_length is set the prompt ran through DefaultInputIDs /
+  // DefaultPositionInputs in a single session.Run with pad tokens at the
+  // tail of input_ids; clear the matching trailing mask cells here so
+  // decode sees mask sum == real_length. Mutually exclusive with the
+  // sliding_window block above by config-load validation.
+  const int fixed_len = model_.config_->model.decoder.fixed_prompt_length;
+  if (first_run_ && fixed_len > 0 && total_length < padded_total_) {
+    position_inputs_->RewindStaticMaskAfterPadding(total_length, padded_total_);
+  }
+
   first_run_ = false;
 
   return logits_.Get();
@@ -413,16 +464,37 @@ void DecoderOnlyPipelineState::UpdateKeyValueCache(DeviceSpan<int32_t> beam_indi
 
 void DecoderOnlyPipelineState::UpdateInputsOutputs(DeviceSpan<int32_t>& next_tokens,
                                                    DeviceSpan<int32_t> beam_indices, int total_length) {
+  const int actual_new = static_cast<int>(next_tokens.size());
   input_ids_->Update(next_tokens);
   size_t new_length = input_ids_->GetShape()[1];
-  position_inputs_->Update(next_tokens, total_length, static_cast<int>(new_length));
+
+  // For the chunked sliding-window path, WindowedInputIDs may emit a
+  // window_size-shaped tensor that is larger than the actual_new tokens we are
+  // appending (the last chunk includes pad tokens). Translate total_length into
+  // that padded coordinate system so position_inputs_->Update sees a total
+  // consistent with the padded next_tokens span it receives. For decode
+  // (actual_new == new_length == 1) this reduces to total_length unchanged.
+  padded_total_ = (total_length - actual_new) + static_cast<int>(new_length);
+
+  auto padded_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
+
+  // WindowedPositionInputs needs the original (un-windowed) token span to calculate
+  // the correct number of windows. padded_tokens is already windowed by WindowedInputIDs
+  // (e.g. 128 tokens), so num_windows_ would be 1 instead of the actual chunk count.
+  const bool slide_inputs = model_.config_->model.decoder.sliding_window.has_value() &&
+                            model_.config_->model.decoder.sliding_window->slide_inputs;
+  if (slide_inputs && actual_new > 1) {
+    position_inputs_->Update(next_tokens, padded_total_, static_cast<int>(new_length));
+  } else {
+    position_inputs_->Update(padded_tokens, padded_total_, static_cast<int>(new_length));
+  }
+
   UpdateKeyValueCache(beam_indices, total_length);
   if (recurrent_state_) {
     recurrent_state_->Update();
   }
 
-  auto next_windowed_tokens = WrapTensor<int32_t>(*model_.p_device_inputs_, *input_ids_->Get());
-  logits_.Update(next_windowed_tokens, new_length);
+  logits_.Update(padded_tokens, new_length);
 }
 
 OrtValue* DecoderOnlyPipelineState::GetOutput(const char* name) {

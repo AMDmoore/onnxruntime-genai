@@ -167,7 +167,8 @@ bool ParseArgs(
     GuidanceArgs& guidance_args,
     std::string& model_path,
     std::string& ep,
-    std::string& ep_path,
+    std::string& ep_name,
+    std::string& ep_library_path,
     std::string& system_prompt,
     std::string& user_prompt,
     bool& verbose,
@@ -175,7 +176,8 @@ bool ParseArgs(
     bool& interactive,
     bool& rewind,
     std::vector<std::string>& image_paths,
-    std::vector<std::string>& audio_paths) {
+    std::vector<std::string>& audio_paths,
+    int& max_new_tokens) {
   CLI::App app{"Command-line arguments for ORT GenAI C/C++ examples"};
   argv = app.ensure_utf8(argv);
 
@@ -206,10 +208,12 @@ bool ParseArgs(
   app.add_flag("-v,--verbose", verbose, "Print verbose output and timing information. Defaults to false");
   app.add_flag("-d,--debug", debug, "Dump input and output tensors with debug mode. Defaults to false");
 
-  app.add_option("--ep_path", ep_path, "Path to execution provider DLL/SO for plug-in providers (ex: onnxruntime_providers_cuda.dll or onnxruntime_providers_tensorrt.dll)");
+  std::vector<std::string> ep_library;
+  app.add_option("--ep_library", ep_library, "Register a plug-in execution provider: <name> <dll_path> (e.g., MorphiZenEP onnxruntime_morphizen_ep.dll)")->expected(2);
   app.add_option("--system_prompt", system_prompt, "System prompt to use for the model.");
   app.add_option("--user_prompt", user_prompt, "User prompt to use for the model.");
   app.add_flag("--rewind", rewind, "Rewind to the system prompt after each generation. Defaults to false. Only used in model_chat.");
+  app.add_option("-g,--max_new_tokens", max_new_tokens, "Max new tokens to generate per prompt (0 = unlimited, use max_length). Only used in model_chat.");
   app.add_flag_callback(
       "--non_interactive", [&] { interactive = false; }, "Disable interactive mode");
 
@@ -222,6 +226,12 @@ bool ParseArgs(
     std::cout << app.help() << std::endl;
     return false;
   }
+
+  if (ep_library.size() == 2) {
+    ep_name = ep_library[0];
+    ep_library_path = ep_library[1];
+  }
+
   return true;
 }
 
@@ -236,19 +246,16 @@ void RegisterEP(const std::string& ep, const std::string& ep_path) {
     return;  // No library path specified, skip registration
   }
 
-  std::cout << "Registering execution provider: " << ep_path << std::endl;
-  auto env = Ort::Env();
+  std::string reg_name = ep;
   if (ep.compare("cuda") == 0) {
-    env.RegisterExecutionProviderLibrary("CUDAExecutionProvider", std::filesystem::path(ep_path).c_str());
+    reg_name = "CUDAExecutionProvider";
   } else if (ep.compare("NvTensorRtRtx") == 0) {
-    env.RegisterExecutionProviderLibrary("NvTensorRTRTXExecutionProvider", std::filesystem::path(ep_path).c_str());
-  } else {
-    std::cout << "Warning: EP registration not supported for " << ep << std::endl;
-    std::cout << "Only 'cuda' and 'NvTensorRtRtx' support plug-in libraries." << std::endl;
-    return;
+    reg_name = "NvTensorRTRTXExecutionProvider";
   }
 
-  std::cout << "Registered " << ep << " successfully!" << std::endl;
+  std::cout << "Registering execution provider: " << reg_name << " from " << ep_path << std::endl;
+  OgaRegisterExecutionProviderLibrary(reg_name.c_str(), ep_path.c_str());
+  std::cout << "Registered " << reg_name << " successfully!" << std::endl;
 }
 
 std::unique_ptr<OgaConfig> GetConfig(const std::string& path, const std::string& ep, const std::unordered_map<std::string, std::string>& ep_options, GeneratorParamsArgs& search_options) {

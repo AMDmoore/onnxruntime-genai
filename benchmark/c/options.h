@@ -22,6 +22,8 @@ struct Options {
   int64_t max_length{0};
   bool verbose{};
   bool reuse_generator{};
+  std::string ep_library_name;
+  std::string ep_library_path;
 };
 
 Options ParseOptionsFromCommandLine(int argc, const char* const* argv);

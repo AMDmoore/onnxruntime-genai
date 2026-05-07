@@ -397,11 +397,67 @@ void DefaultPositionInputs::RewindMask(size_t index) {
   }
 }
 
+// [NO_CHUNK_EXPERIMENTAL] Legacy no-chunk static-shape pad cleanup. Called
+// once from DecoderOnlyPipelineState::Run, immediately after the single
+// prefill Run on the fixed_prompt_length path, to zero the trailing pad
+// cells of the static attention_mask so subsequent decode steps see
+// mask sum == real_length. No-op on any other path (sliding_window, dynamic
+// shape, etc.). May be removed alongside fixed_prompt_length.
+void DefaultPositionInputs::RewindStaticMaskAfterPadding(int real_length, int padded_length) {
+  if (!has_mask_input_ || !ShouldUseStaticMaskHandling())
+    return;
+  if (real_length >= padded_length)
+    return;
+
+  auto mask_span = attention_mask_->GetByteSpan();
+  auto cpu = mask_span.CopyDeviceToCpu();
+
+  if (type_ == Ort::TypeToTensorType<int32_t>) {
+    auto* data = reinterpret_cast<int32_t*>(cpu.data());
+    std::fill(data + real_length, data + padded_length, int32_t{0});
+  } else {
+    auto* data = reinterpret_cast<int64_t*>(cpu.data());
+    std::fill(data + real_length, data + padded_length, int64_t{0});
+  }
+
+  mask_span.CopyCpuToDevice();
+}
+
 bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
+  // [NO_CHUNK_EXPERIMENTAL] The CPU branch re-enables the static-mask
+  // allocation path on CPU when fixed_prompt_length is in use (the original
+  // path the legacy mode was designed for). The sliding_window path has its
+  // own mask management and does not rely on this predicate on CPU.
+  // MorphiZenEP must be treated like CPU here because the morphizen-compiled
+  // models expect attention_mask of shape [batch, max_length] (fixed-shape,
+  // matching the prefill_p128m16384.onnx / decode_p128m16384.onnx pair). Before
+  // path A, OGA misclassified MorphiZenEP as CPU and took this branch by
+  // accident; now that MorphiZenEP has its own DeviceType we add it
+  // explicitly so attention_mask shape stays compatible with the model.
   return state_.params_->use_graph_capture ||
          (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
-          model_.p_device_->GetType() == DeviceType::NvTensorRtRtx);
+          (model_.p_device_->GetType() == DeviceType::NvTensorRtRtx ||
+           model_.p_device_->GetType() == DeviceType::CPU ||
+           model_.p_device_->GetType() == DeviceType::MorphiZenEP));
 }
+
+namespace {
+template <typename Fn>
+void WithTypedMutableData(OrtValue& value, ONNXTensorElementDataType type, Fn&& fn) {
+  if (type == Ort::TypeToTensorType<int64_t>)
+    fn(value.GetTensorMutableData<int64_t>());
+  else
+    fn(value.GetTensorMutableData<int32_t>());
+}
+
+template <typename Fn>
+void WithTypedConstData(const OrtValue& value, ONNXTensorElementDataType type, Fn&& fn) {
+  if (type == Ort::TypeToTensorType<int64_t>)
+    fn(value.GetTensorData<int64_t>());
+  else
+    fn(value.GetTensorData<int32_t>());
+}
+}  // namespace
 
 // TODO: SlidingWindow does not support graph capture
 WindowedPositionInputs::WindowedPositionInputs(State& state)
@@ -418,20 +474,26 @@ WindowedPositionInputs::WindowedPositionInputs(State& state)
     if (window_size_ == 0) {
       throw std::runtime_error("Window size must be greater than 0");
     }
+
+    // Cache the alignment flag so the hot Update() path can branch on a bool
+    // rather than a string compare. See class-level banner in the header.
+    is_left_alignment_ = (model_.config_->model.decoder.sliding_window->alignment == "left");
   }
 
   if (has_posid_input_) {
     position_ids_type_ = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.position_ids);
-    if (position_ids_type_ != Ort::TypeToTensorType<int32_t>)
-      throw std::runtime_error("WindowedPositionInputs only supports int32_t position_ids");
+    if (position_ids_type_ != Ort::TypeToTensorType<int32_t> &&
+        position_ids_type_ != Ort::TypeToTensorType<int64_t>)
+      throw std::runtime_error("WindowedPositionInputs only supports int32_t or int64_t position_ids");
 
     position_ids_shape_ = {1, model_.config_->model.decoder.sliding_window->window_size};
   }
 
   if (has_mask_input_) {
     attention_mask_type_ = model_.session_info_.GetInputDataType(model_.config_->model.decoder.inputs.attention_mask);
-    if (attention_mask_type_ != Ort::TypeToTensorType<int32_t>)
-      throw std::runtime_error("WindowedPositionInputs only supports int32_t attention_mask");
+    if (attention_mask_type_ != Ort::TypeToTensorType<int32_t> &&
+        attention_mask_type_ != Ort::TypeToTensorType<int64_t>)
+      throw std::runtime_error("WindowedPositionInputs only supports int32_t or int64_t attention_mask");
 
     attention_mask_shape_ = {1, model_.config_->model.context_length};
   }
@@ -451,90 +513,137 @@ void WindowedPositionInputs::Add() {
   }
 }
 
-void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) {
+size_t WindowedPositionInputs::CountPadsInChunk(DeviceSpan<int32_t> next_tokens, size_t chunk_index) const {
+  const auto pad_id = model_.config_->model.pad_token_id;
+  const auto& span = next_tokens.CpuSpan();
+  const size_t start = chunk_index * window_size_;
+  // Defensive: chunk entirely past the end of next_tokens. This should not
+  // happen for valid num_windows_ = ceil(size/window_size_), but preserves
+  // the original lambda's behaviour exactly.
+  if (start >= span.size()) return 0;
+  const size_t end = std::min(start + window_size_, span.size());
+  size_t count = 0;
+  for (size_t i = start; i < end; ++i) {
+    if (span[i] == pad_id) ++count;
+  }
+  // Treat any tokens missing past the end of next_tokens as pads as well.
+  count += (start + window_size_) - end;
+  return count;
+}
+
+void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int /*total_length*/, int /*new_length*/) {
   if (!has_posid_input_ && !has_mask_input_) {
     return;
   }
 
-  if (window_index_ == 0) {
-    num_windows_ = (next_tokens.size() + window_size_ - 1) / window_size_;
-    if (has_posid_input_) {
-      position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
+  // Consume any deferred pad clear from the last prefill chunk of a PRIOR
+  // Update() call. We do this at the TOP of Update() (not just in the decode
+  // branch) because chat mode issues multiple AppendTokens() / ComputeLogits()
+  // passes: each AppendTokens triggers its own prefill Run. Between Run #1
+  // (e.g. system prompt) and Run #2 (user prompt), no decode Update ever
+  // fires, so deferring the consume to the decode branch would leak Run #1's
+  // pad 1s into Run #2's mask -- silently expanding past_sequence_length and
+  // misplacing K/V for every subsequent prompt batch. Consuming here is safe
+  // for all callers because DeferLastChunkPadClearLeft only sets the pending
+  // count at the END of the LAST prefill chunk; intermediate-chunk and decode
+  // Updates observe pending == 0 and this is a no-op.
+  if (is_left_alignment_) {
+    ConsumeDeferredPadClearLeft();
+  }
 
-      // next_tokens will always be padded so that it's size is a multiple of window_size_
-      // next_tokens -> [0, a, b, c, d, e]
-      // window_size = 3, num_windows = 2, pad_token = 0
-      // window_index = 0, position_ids_ -> [0, 0, 1]
-      auto* position_ids_data = position_ids_->GetTensorMutableData<int32_t>();
-      for (int i = 0, j = 0; i < position_ids_shape_[1]; i++) {
-        if (next_tokens.Span()[i] == model_.config_->model.pad_token_id) {
-          position_ids_data[i] = 0;
-        } else {
-          position_ids_data[i] = j++;
-        }
+  // Mirror WindowedInputIDs::Update's branching: the prefill-init branch must
+  // require next_tokens.size() > 1 in addition to window_index_ == 0. Otherwise
+  // a single-token decode call -- which always lands here with
+  // window_index_ == 0 once we've reset between prompts -- would be
+  // misinterpreted as the start of a new prefill batch and produce
+  // [1, window_size] position_ids when the decode session expects [1, 1].
+  // (Known limitation, shared with WindowedInputIDs: a 1-token prompt cannot
+  // be distinguished from a 1-token decode by shape alone and will be routed
+  // to the else "all chunks done" branch.)
+  if (next_tokens.size() > 1 && window_index_ == 0) {
+    num_windows_ = (next_tokens.size() + window_size_ - 1) / window_size_;
+
+    // historical_num_tokens_ doubles as the past-real count AND the
+    // "not-the-first-prefill" flag: it is non-zero iff an earlier prefill
+    // (+optional decode) batch already populated state on this generator
+    // (multi-AppendTokenSequences / chat mode).
+    const bool has_prior_tokens = (historical_num_tokens_ > 0);
+
+    if (is_left_alignment_) {
+      InitChunk0Left(next_tokens, has_prior_tokens);
+    } else {
+      // TODO(sliding_window): alignment="right" + multi-AppendTokenSequences
+      // (chat mode) is not supported. The pre-split reference did not
+      // exercise it and we have not designed the K/V-cache bookkeeping for
+      // it. Reject here rather than silently corrupting state. If/when
+      // support is added, remove this throw and add coverage under
+      // Validation.
+      if (has_prior_tokens) {
+        throw std::runtime_error(
+            "WindowedPositionInputs alignment=\"right\" does not support "
+            "subsequent prefill batches (multiple AppendTokenSequences). "
+            "Use alignment=\"left\" for chat-style multi-prompt scenarios.");
       }
+      InitChunk0Right(next_tokens);
     }
 
-    if (has_mask_input_) {
-      attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
+    historical_num_tokens_ += window_size_ - CountPadsInChunk(next_tokens, 0);
 
-      // next_tokens will always be padded so that it's size is a multiple of window_size_
-      // next_tokens -> [0, a, b, c, d, e]
-      // window_size = 3, num_windows = 2, pad_token = 0
-      // window_index = 0, attention_mask_ -> ([0] * context_length - window_size_) + [0, 1, 1]
-      auto* attention_mask_data = attention_mask_->GetTensorMutableData<int32_t>();
-      std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, 0);
-      for (size_t i = 0; i < window_size_; i++) {
-        attention_mask_data[attention_mask_shape_[1] - window_size_ + i] = next_tokens.CpuSpan()[i] == model_.config_->model.pad_token_id ? 0 : 1;
-      }
-      for (size_t i = 0; i < window_size_; i++) {
-        if (attention_mask_data[attention_mask_shape_[1] - window_size_ + i] == 1) {
-          attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ + i - 1;
-          break;
-        }
-      }
+    window_index_++;
+    if (is_left_alignment_) {
+      DeferLastChunkPadClearLeft(next_tokens);
     }
   } else if (window_index_ < num_windows_) {
-    if (has_posid_input_) {
-      // next_tokens will always be padded so that it's size is a multiple of window_size_
-      // next_tokens -> [0, a, b, c, d, e]
-      // window_size = 3, num_windows = 2, pad_token = 0
-      // window_index = 1, position_ids_ -> [2, 3, 4]
-
-      auto* position_ids_data = position_ids_->GetTensorMutableData<int32_t>();
-      const auto last_position = position_ids_data[window_size_ - 1];
-      std::iota(position_ids_data, position_ids_data + window_size_, last_position + 1);
+    if (is_left_alignment_) {
+      UpdateIntermediateChunkLeft();
+    } else {
+      UpdateIntermediateChunkRight();
     }
+    historical_num_tokens_ += window_size_ - CountPadsInChunk(next_tokens, window_index_);
 
-    if (has_mask_input_) {
-      // next_tokens will always be padded so that it's size is a multiple of window_size_
-      // next_tokens -> [0, a, b, c, d, e]
-      // window_size = 3, num_windows = 2, pad_token = 0
-      // window_index = 1, attention_mask_ -> ([0] * context_length - (2 * window_size_)) + [0, 1, 1, 1, 1, 1]
-      auto* attention_mask_data = attention_mask_->GetTensorMutableData<int32_t>();
-      std::fill_n(attention_mask_data + attention_mask_backward_offset_ - window_size_ + 1, window_size_, 1);
-      attention_mask_backward_offset_ -= window_size_;
+    window_index_++;
+    if (is_left_alignment_) {
+      DeferLastChunkPadClearLeft(next_tokens);
     }
   } else {
-    // All prompt token chunks have been processed. Now we process the tokens generated by the model.
-    if (has_posid_input_) {
-      // next_tokens -> [f]
-      // position_ids_ -> [5]
-      const auto last_position = position_ids_->GetTensorData<int32_t>()[position_ids_shape_[1] - 1];
-      if (position_ids_shape_[1] != 1) {
-        position_ids_shape_[1] = 1;
-        position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
-      }
-      position_ids_->GetTensorMutableData<int32_t>()[0] = last_position + 1;
-    }
+    // All prompt token chunks have been processed. Any deferred pad clear
+    // from the last prefill chunk was already consumed at the top of
+    // Update() above, so forward_offset_ already points at num_reals here
+    // and the decode mask write below lands on the first empty slot.
 
-    if (has_mask_input_) {
-      // next_tokens -> [f]
-      // attention_mask_ -> ([0] * context_length - (2 * window_size_) - 1) + [0, 1, 1, 1, 1, 1, 1]
-      attention_mask_->GetTensorMutableData<int32_t>()[attention_mask_backward_offset_] = 1;
-      if (attention_mask_backward_offset_ > 0) {
-        attention_mask_backward_offset_ -= 1;
-      }
+    // Now we process the tokens generated by the model.
+    if (has_posid_input_) {
+      WithTypedConstData(*position_ids_, position_ids_type_, [&](auto const* data) {
+        using T = std::remove_const_t<std::remove_pointer_t<decltype(data)>>;
+        // For alignment="left": pads in the last chunk's window receive
+        // position_id 0 (chunk-0 init) or bogus increasing positions
+        // (intermediate-chunk iota), so data[last] is not a reliable "max
+        // real position". historical_num_tokens_ tracks the true real-token
+        // count = 0-indexed position of the next real token.
+        //
+        // TODO(sliding_window): right-branch mirrors the pre-split
+        // "data[last]+1" formula, which is correct for right because
+        // chunk-0 init wrote the last real position at slot window_size_-1
+        // for the single-chunk case. Not validated end-to-end on this
+        // stack; see class-level banner in position_inputs.h and the
+        // InitChunk0Right banner for the full risk description.
+        const T next_position = is_left_alignment_
+            ? static_cast<T>(historical_num_tokens_)
+            : static_cast<T>(data[position_ids_shape_[1] - 1]) + T{1};
+        if (position_ids_shape_[1] != 1) {
+          position_ids_shape_[1] = 1;
+          position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
+        }
+        position_ids_->GetTensorMutableData<T>()[0] = next_position;
+      });
+    }
+    // Each decode step appends one real generated token to the history.
+    historical_num_tokens_++;
+
+    if (is_left_alignment_) {
+      UpdateDecodeMaskExtensionLeft();
+    } else {
+      UpdateDecodeMaskExtensionRight();
     }
   }
 
@@ -546,7 +655,396 @@ void WindowedPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_l
     state_.inputs_[attention_mask_index_] = attention_mask_.get();
   }
 
-  window_index_++;
+  // Symmetric to WindowedInputIDs::Update: window_index_ is only incremented
+  // inside the two prefill branches above (chunk 0 and intermediate chunks),
+  // NOT in the decode else branch. The earlier unconditional increment here
+  // caused window_index_ to drift upward across decode steps, so a subsequent
+  // AppendTokenSequences call (e.g. turn 2 of an interactive chat) would fail
+  // the "window_index_ == 0" guard on the prefill-init branch and fall through
+  // to the decode branch, producing [1, 1] position_ids while WindowedInputIDs
+  // still produced [1, window_size] input_ids -- session.Run then reports
+  // "position_ids Got: 1 Expected: <window_size>".
+  //
+  // Once we've dispatched the final prefill window the counters are reset so
+  // a subsequent decode call routes through the "all chunks done" else branch
+  // above, and -- combined with the position_ids_shape_[1] restoration at the
+  // top of InitChunk0Left -- so a subsequent prompt-processing call can
+  // re-enter chunked prefill cleanly.
+  if (window_index_ == num_windows_) {
+    window_index_ = 0;
+    num_windows_ = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk-0 prefill initializer for alignment="left".
+// ---------------------------------------------------------------------------
+// In alignment="left" the AllocateInputIdsOnDevice side places real tokens at
+// the HEAD of each chunk window and pad tokens at the TAIL. The host-side
+// attention_mask uses a "rightward-growing" layout that mirrors the K/V
+// cache's packed-at-slot-0 convention:
+//
+//   Before chunk 0:                         [ 0 0 0 ... 0 ]                  fo=0
+//   After  chunk 0 painted   (window_size): [ 1 1 1 .. 1 | 0 0 0 ]           fo=ws
+//   After  Finalize (pads in last chunk):   [ 1 1 .. 1 0 0 | 0 0 ]           fo=num_reals
+//   After  decode step 1:                   [ 1 1 .. 1 1   | 0 0 ]           fo=num_reals+1
+//   Continuation prefill (has_prior_tokens):[ 1..1 | 1 1 1 1 1 .. 1 | 0 0 ]  fo=num_reals+ws
+//     (existing 1s preserved, new window painted at [fo-ws, fo))
+//
+// Invariant (after any successful Update call): sum(mask) == forward_offset_
+// == number of valid K/V slots == total real tokens (pre-any-in-flight-pads).
+// This matches DefaultKeyValueCache 1:1: mask slot i is valid iff K/V slot i
+// is valid.
+void WindowedPositionInputs::InitChunk0Left(DeviceSpan<int32_t> next_tokens, bool has_prior_tokens) {
+  if (has_posid_input_) {
+    // Restore window-shaped tensor in case a prior decode step shrank
+    // position_ids_shape_ to [1, 1] (see the "all chunks done" branch in
+    // Update). Without this, a subsequent prompt-processing call (e.g.
+    // continuous decoding via a second AppendTokens) would create a [1, 1]
+    // position_ids here and feed it to the prefill model -- which expects
+    // [1, window_size] -- producing "Got: 1 Expected: <window_size>" at
+    // session.Run.
+    position_ids_shape_[1] = window_size_;
+    position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
+
+    WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
+      using T = std::remove_pointer_t<decltype(position_ids_data)>;
+      // Position ids count up from historical_num_tokens_ for non-pad tokens
+      // (0 for the very first prefill). Pad tokens get position 0 so the
+      // model treats them as masked-out garbage; their outputs are discarded.
+      for (int i = 0, j = static_cast<int>(historical_num_tokens_); i < position_ids_shape_[1]; i++) {
+        if (next_tokens.Span()[i] == model_.config_->model.pad_token_id) {
+          position_ids_data[i] = T{0};
+        } else {
+          position_ids_data[i] = static_cast<T>(j++);
+        }
+      }
+    });
+  }
+
+  if (!has_mask_input_) return;
+
+  if (!has_prior_tokens) {
+    // First prefill ever: allocate a fresh, zero-filled mask buffer. Chunk
+    // 0's window will be painted at slots [0, window_size_) below; every
+    // later chunk / decode step appends 1s to the right. OrtValue::
+    // CreateTensor does NOT zero-initialize by default, so we must do it
+    // explicitly -- downstream code relies on the "trailing slots are 0"
+    // invariant (ConsumeDeferredPadClearLeft, the forward walks, and GQA's
+    // reduce_sum all depend on it).
+    attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
+    WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+      using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+      std::fill_n(attention_mask_data, attention_mask_shape_[1], T{0});
+    });
+    attention_mask_forward_offset_ = 0;
+  }
+  // else: continuation prefill -- PRESERVE the existing mask state (1s at
+  // [0, forward_offset_) from prior prefill chunks + decode steps, 0s
+  // everywhere else) and place this chunk's window at [forward_offset_,
+  // forward_offset_ + window_size_). This path unifies with the first
+  // prefill: both just "paint window_size_ 1s starting at forward_offset_".
+
+  // Guard against exhausting the buffer. Applies equally to the first
+  // prefill (forward_offset_ == 0) and continuation prefill
+  // (forward_offset_ == num_reals_so_far). If this chunk would spill past
+  // the buffer we have nowhere to place the rest of the prefill nor any
+  // decode tokens that follow.
+  if (attention_mask_forward_offset_ + window_size_ > static_cast<size_t>(attention_mask_shape_[1])) {
+    throw std::runtime_error(
+        std::string("WindowedPositionInputs: ") + (has_prior_tokens ? "continuation " : "") +
+        "prefill would exhaust the attention_mask buffer (context_length=" +
+        std::to_string(attention_mask_shape_[1]) + ", window_size=" +
+        std::to_string(window_size_) + ", forward_offset=" +
+        std::to_string(attention_mask_forward_offset_) +
+        "). The model's context_length is too small to fit another chunked "
+        "prefill plus subsequent decode on top of the existing KV-cache "
+        "state. Either rebuild the model with a larger context_length or "
+        "merge/shorten the prompt history.");
+  }
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    std::fill_n(attention_mask_data + attention_mask_forward_offset_, window_size_, T{1});
+  });
+  attention_mask_forward_offset_ += window_size_;
+}
+
+// ---------------------------------------------------------------------------
+// Chunk-0 prefill initializer for alignment="right".
+// ---------------------------------------------------------------------------
+// RISK: NOT YET VALIDATED end-to-end on this PR's stack. This path is kept
+// as reference code for Phi-3.5-MoE-style models that pair alignment="right"
+// with WindowedKeyValueCache (slide_key_value_cache=true); the K/V cache
+// slides leftward as decode overwrites the leading pad slots.
+//
+// Layout (leftward-growing): pads at the HEAD, reals at the TAIL of each
+// window. Chunk 0 lives at [context_length - window_size, context_length);
+// decode subsequently walks attention_mask_backward_offset_ leftward.
+//
+// DO NOT mix with DefaultKeyValueCache -- the K/V layout assumptions do not
+// hold and outputs will silently corrupt.
+//
+// Divergences from the pre-split implementation:
+//   - Templated over position_ids_type_ / attention_mask_type_ so int64
+//     mask models work (the original hardcoded int32_t); behaviour on int32
+//     paths is bit-identical.
+//
+// TODO(sliding_window):
+//   - Add an end-to-end test covering a Phi-3.5-MoE-style config.
+//   - Verify chunk-0 outputs match the pre-split reference byte-for-byte.
+//   - Consider gating this path behind an explicit opt-in flag until
+//     validation lands, given the silent-corruption risk above.
+void WindowedPositionInputs::InitChunk0Right(DeviceSpan<int32_t> next_tokens) {
+  if (has_posid_input_) {
+    // Restore window-shaped tensor in case a prior call shrank
+    // position_ids_shape_ to [1, 1]. The pre-split implementation never did
+    // this restore (it did not support continuous decoding), but our shared
+    // decode branch reshapes on "all chunks done", so we must re-create
+    // here for consistency even on the right path.
+    position_ids_shape_[1] = window_size_;
+    position_ids_ = OrtValue::CreateTensor(model_.allocator_cpu_, position_ids_shape_, position_ids_type_);
+
+    // next_tokens will always be padded so that it's size is a multiple of window_size_
+    // next_tokens -> [0, a, b, c, d, e]
+    // window_size = 3, num_windows = 2, pad_token = 0
+    // window_index = 0, position_ids_ -> [0, 0, 1]
+    WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
+      using T = std::remove_pointer_t<decltype(position_ids_data)>;
+      for (int i = 0, j = 0; i < position_ids_shape_[1]; i++) {
+        if (next_tokens.Span()[i] == model_.config_->model.pad_token_id) {
+          position_ids_data[i] = T{0};
+        } else {
+          position_ids_data[i] = static_cast<T>(j++);
+        }
+      }
+    });
+  }
+
+  if (has_mask_input_) {
+    attention_mask_ = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, attention_mask_type_);
+
+    // next_tokens will always be padded so that it's size is a multiple of window_size_
+    // next_tokens -> [0, a, b, c, d, e]
+    // window_size = 3, num_windows = 2, pad_token = 0
+    // window_index = 0, attention_mask_ -> ([0] * context_length - window_size_) + [0, 1, 1]
+    WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+      using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+      std::fill_n(attention_mask_data, attention_mask_shape_[1] - window_size_, T{0});
+      for (size_t i = 0; i < window_size_; i++) {
+        attention_mask_data[attention_mask_shape_[1] - window_size_ + i] =
+            next_tokens.CpuSpan()[i] == model_.config_->model.pad_token_id ? T{0} : T{1};
+      }
+      for (size_t i = 0; i < window_size_; i++) {
+        if (attention_mask_data[attention_mask_shape_[1] - window_size_ + i] == T{1}) {
+          attention_mask_backward_offset_ = attention_mask_shape_[1] - window_size_ + i - 1;
+          break;
+        }
+      }
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate prefill chunk for alignment="left" (chunks 1..num_windows_-1).
+// ---------------------------------------------------------------------------
+// Intermediate chunks never contain pads (pads only sit in the last chunk
+// for "left"), so position_ids is a plain iota continuation from the prior
+// chunk and the mask just extends window_size_ 1s rightward from
+// forward_offset_.
+void WindowedPositionInputs::UpdateIntermediateChunkLeft() {
+  if (has_posid_input_) {
+    WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
+      const auto last_position = position_ids_data[window_size_ - 1];
+      std::iota(position_ids_data, position_ids_data + window_size_, last_position + 1);
+    });
+  }
+
+  if (!has_mask_input_) return;
+
+  if (attention_mask_forward_offset_ + window_size_ > static_cast<size_t>(attention_mask_shape_[1])) {
+    throw std::runtime_error(
+        "WindowedPositionInputs: intermediate prefill chunk would exhaust "
+        "the attention_mask buffer (context_length=" +
+        std::to_string(attention_mask_shape_[1]) + ", window_size=" +
+        std::to_string(window_size_) + ", forward_offset=" +
+        std::to_string(attention_mask_forward_offset_) + ").");
+  }
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    std::fill_n(attention_mask_data + attention_mask_forward_offset_, window_size_, T{1});
+  });
+  attention_mask_forward_offset_ += window_size_;
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate prefill chunk for alignment="right".
+// ---------------------------------------------------------------------------
+// RISK: NOT YET VALIDATED end-to-end on this PR's stack. Paired with
+// WindowedKeyValueCache only. See InitChunk0Right banner for the full
+// layout description and silent-corruption warning.
+//
+// Paint [backward_offset_ - window_size_ + 1, backward_offset_ + 1) = 1 and
+// rewind backward_offset_ leftward by window_size_. The posid iota is
+// identical to the left path by coincidence (monotonically increasing
+// positions are correct either way for pad-free intermediate chunks); we
+// duplicate the ~6 lines rather than share a helper to keep the
+// frozen-vs-maintained boundary visible.
+//
+// TODO(sliding_window): validate intermediate-chunk mask output byte-for-
+//   byte against the pre-split reference.
+void WindowedPositionInputs::UpdateIntermediateChunkRight() {
+  if (has_posid_input_) {
+    WithTypedMutableData(*position_ids_, position_ids_type_, [&](auto* position_ids_data) {
+      const auto last_position = position_ids_data[window_size_ - 1];
+      std::iota(position_ids_data, position_ids_data + window_size_, last_position + 1);
+    });
+  }
+
+  if (!has_mask_input_) return;
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    std::fill_n(attention_mask_data + attention_mask_backward_offset_ - window_size_ + 1, window_size_, T{1});
+  });
+  attention_mask_backward_offset_ -= window_size_;
+}
+
+// ---------------------------------------------------------------------------
+// Per-decode-step mask extension for alignment="left".
+// ---------------------------------------------------------------------------
+// Writes 1 at forward_offset_ (the next empty slot) and advances
+// forward_offset_ rightward by 1. After the call:
+//   sum(mask) == forward_offset_ == total valid K/V slots
+// which is exactly the invariant DefaultKeyValueCache expects.
+void WindowedPositionInputs::UpdateDecodeMaskExtensionLeft() {
+  if (!has_mask_input_) return;
+
+  if (attention_mask_forward_offset_ >= static_cast<size_t>(attention_mask_shape_[1])) {
+    throw std::runtime_error(
+        "WindowedPositionInputs: decode step past end of attention_mask "
+        "buffer (context_length=" + std::to_string(attention_mask_shape_[1]) +
+        "). Context length is too small for the accumulated prompt + "
+        "generated history.");
+  }
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    attention_mask_data[attention_mask_forward_offset_] = T{1};
+  });
+  attention_mask_forward_offset_ += 1;
+}
+
+// ---------------------------------------------------------------------------
+// Per-decode-step mask extension for alignment="right".
+// ---------------------------------------------------------------------------
+// RISK: NOT YET VALIDATED end-to-end on this PR's stack. Paired with
+// WindowedKeyValueCache only. See InitChunk0Right banner for the full
+// risk description.
+//
+// Writes 1 at backward_offset_ and rewinds backward_offset_ leftward by 1.
+// This overwrites the leading pad cells of chunk 0 with real-token mask
+// bits as decode progresses -- only semantically valid when the K/V cache
+// slides in lockstep (WindowedKeyValueCache does this). If paired with
+// DefaultKeyValueCache this WILL silently corrupt attention outputs.
+//
+// TODO(sliding_window): validate decode-step mask output byte-for-byte
+//   against the pre-split reference.
+void WindowedPositionInputs::UpdateDecodeMaskExtensionRight() {
+  if (!has_mask_input_) return;
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    attention_mask_data[attention_mask_backward_offset_] = T{1};
+  });
+  if (attention_mask_backward_offset_ > 0) {
+    attention_mask_backward_offset_ -= 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: defer last-prefill-chunk pad cleanup for alignment="left".
+// ---------------------------------------------------------------------------
+// Called from both prefill branches of Update() after window_index_ has
+// been incremented; fires only when this was the last chunk of the current
+// prefill batch AND alignment="left" AND a mask is present. No-op for
+// alignment="right" (its chunk-0 init paints pad cells as 0 inline, no
+// post-chunk cleanup required).
+//
+// WHY DEFERRED: the last prefill chunk's Run() has NOT yet executed when
+// Update() finishes. That Run() needs total_sequence_length ==
+// forward_offset_ (including pads) so GQA places K/V at
+//   past_seq = forward_offset_ - window_size_
+// which is exactly the first slot this chunk should write to. If we
+// cleared the pads here, total_sequence_length would shrink by pad_count
+// and past_seq would fall INSIDE the prior chunk's K/V range, silently
+// clobbering it. Concretely, with ws=128 and 4 chunks (62 pads in chunk 3):
+//   pre-clear: past_seq = 512 - 128 = 384  -> writes K/V[384..512)  OK
+//   post-clear: past_seq = 450 - 128 = 322 -> writes K/V[322..450)  BUG
+//     (slots [322..384) overlap chunk 2's already-written K/V)
+//
+// So we merely record the pad count; the actual clear happens at the top
+// of the NEXT Update() call (ConsumeDeferredPadClearLeft), after the last
+// prefill Run() has consumed the uncleared mask. The "next Update" may be
+// a decode step (single-prompt generation) OR another prefill-init from a
+// second AppendTokens() call (chat mode's system-then-user flow) -- both
+// paths need the mask cleaned before they touch forward_offset_.
+void WindowedPositionInputs::DeferLastChunkPadClearLeft(DeviceSpan<int32_t> next_tokens) {
+  // Alignment gating lives at the call site in Update() for consistency
+  // with the other *Left / *Right helpers; this helper is entered only
+  // when is_left_alignment_ is true.
+  if (!has_mask_input_) return;
+  if (num_windows_ == 0) return;
+  if (window_index_ != num_windows_) return;
+
+  const size_t pad_count = CountPadsInChunk(next_tokens, num_windows_ - 1);
+  if (pad_count == 0 || pad_count > window_size_) return;
+
+  pending_last_chunk_pad_clear_ = pad_count;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: consume deferred pad cleanup for alignment="left".
+// ---------------------------------------------------------------------------
+// Called at the TOP of every Update() (before branch dispatch). By this
+// point the PRIOR Update()'s last prefill chunk has had its Run() executed
+// with the uncleared mask (total_sequence_length still included pads), so
+// K/V was placed correctly at past_seq = forward_offset_ - window_size_.
+// Now we:
+//   1. Zero the pad cells at [forward_offset_ - pad_count, forward_offset_).
+//   2. Rewind forward_offset_ by pad_count.
+// After this call the invariant
+//   sum(mask) == forward_offset_ == historical_num_tokens_ == num_reals
+// is restored, so the NEXT branch -- whether it is a decode mask write, an
+// intermediate chunk paint, or a new prefill-init for the next
+// AppendTokens() batch -- sees a clean state and writes at exactly slot
+// num_reals (which overwrites the now-stale pad K/V on this chunk's last
+// few slots).
+//
+// Intermediate-chunk Update() and decode-after-decode Update() observe
+// pending == 0 and this is a no-op; only the FIRST Update() after a last
+// prefill chunk does real work.
+void WindowedPositionInputs::ConsumeDeferredPadClearLeft() {
+  // Alignment gating lives at the call site in Update() for consistency
+  // with the other *Left / *Right helpers; this helper is entered only
+  // when is_left_alignment_ is true.
+  if (!has_mask_input_) return;
+  if (pending_last_chunk_pad_clear_ == 0) return;
+
+  const size_t pad_count = pending_last_chunk_pad_clear_;
+  pending_last_chunk_pad_clear_ = 0;
+
+  // Defensive: both conditions should hold by construction, but guard
+  // against state corruption from an unexpected call ordering.
+  if (pad_count > attention_mask_forward_offset_) return;
+  if (pad_count > window_size_) return;
+
+  WithTypedMutableData(*attention_mask_, attention_mask_type_, [&](auto* attention_mask_data) {
+    using T = std::remove_pointer_t<decltype(attention_mask_data)>;
+    std::fill_n(attention_mask_data + attention_mask_forward_offset_ - pad_count, pad_count, T{0});
+  });
+  attention_mask_forward_offset_ -= pad_count;
 }
 
 // Qwen2VLPositionInputs implementation

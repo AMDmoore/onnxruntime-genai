@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 //
 // Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
@@ -21,6 +21,7 @@
 #include "webgpu/interface.h"
 #include "openvino/interface.h"
 #include "ryzenai/interface.h"
+#include "morphizen_ep/interface.h"
 #include "engine/engine.h"
 
 #if defined(_WIN32)
@@ -102,6 +103,7 @@ void Shutdown() {
   GetOrtGlobals().reset();  // Delete now because on process exit is too late
 
   RyzenAIInterface::Shutdown();
+  MorphiZenEPInterface::Shutdown();
 }
 
 OrtEnv& GetOrtEnv() {
@@ -234,6 +236,8 @@ std::string to_string(DeviceType device_type) {
       return "NvTensorRtRtx";
     case DeviceType::RyzenAI:
       return "RyzenAI";
+    case DeviceType::MorphiZenEP:
+      return "MorphiZenEP";
     default:
       throw std::runtime_error("Unknown device type");
   }
@@ -259,6 +263,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
       return GetOpenVINOInterface();
     case DeviceType::RyzenAI:
       return GetRyzenAIInterface();
+    case DeviceType::MorphiZenEP:
+      return GetMorphiZenEPInterface();
   }
 }
 
@@ -423,6 +429,21 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
     throw std::runtime_error("Continuous decoding is not supported on the selected device type (" + to_string(state_->model_.p_device_kvcache_->GetType()) +
                              "). Please recreate the generator instance to avoid using continuous decoding.");
 
+  // [NO_CHUNK_EXPERIMENTAL] The legacy fixed_prompt_length path was never
+  // designed for continuous decoding (chat mode's multiple AppendTokens
+  // calls): the single-Run static-shape flow has no notion of a running
+  // KV history across separate prompt batches. Reject explicitly rather
+  // than silently corrupting outputs. Use the sliding_window path with
+  // alignment="left" for chat-style scenarios.
+  if (search_->GetSequenceLength() != 0 &&
+      model_->config_->model.decoder.fixed_prompt_length > 0) {
+    throw std::runtime_error(
+        "Continuous decoding (multiple AppendTokens calls) is not supported "
+        "on the experimental fixed_prompt_length path. Use sliding_window "
+        "with alignment=\"left\" instead, or call RewindToLength(0) before "
+        "the next AppendTokens call.");
+  }
+
   // Set any extra inputs (those defined in extra_inputs and those defined in the PresetExtraInputs registry)
   if (set_extra_inputs_) {
     state_->SetExtraInputs(extra_inputs_);
@@ -430,7 +451,28 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
   }
 
   auto input_ids_device = AllocateInputIdsOnDevice(input_ids);
-  search_->AppendTokens(input_ids_device);
+
+  // For sliding-window models with slide_inputs, AllocateInputIdsOnDevice pads
+  // input_ids up to a multiple of window_size with pad_token_id. The pad tokens
+  // are needed by the model (so each chunk has window_size entries), but they
+  // must NOT be appended to the search sequence -- otherwise the user-visible
+  // generated text contains spurious pad/EOS tokens between the prompt and the
+  // model's first real generated token (the pad count = window_size - real
+  // prompt length, e.g. 107 for a 21-token prompt with window_size=128).
+  const bool slide_inputs_padded =
+      model_->config_->model.decoder.sliding_window.has_value() &&
+      model_->config_->model.decoder.sliding_window->slide_inputs &&
+      input_ids_device.size() != input_ids.size();
+
+  if (slide_inputs_padded) {
+    auto unpadded_for_search = state_->params_->p_device->Allocate<int32_t>(input_ids.size());
+    std::copy(input_ids.begin(), input_ids.end(), unpadded_for_search.CpuSpan().begin());
+    unpadded_for_search.CopyCpuToDevice();
+    search_->AppendTokens(unpadded_for_search);
+  } else {
+    search_->AppendTokens(input_ids_device);
+  }
+
   computed_logits_ = false;
   ComputeLogits(input_ids_device);
 }

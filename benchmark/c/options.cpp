@@ -53,6 +53,10 @@ namespace {
     << "    --reuse_generator\n"
     << "      Reuse a single generator via RewindTo(0) instead of creating a new one per\n"
     << "      iteration. Disabled by default.\n"
+    << "    --ep_library <name> <path>\n"
+    << "      Register a custom execution provider library before loading the model.\n"
+    << "      <name> is the registration name (matching provider_options in genai_config.json),\n"
+    << "      <path> is the path to the EP shared library (DLL/so).\n"
     << "    -v,--verbose\n"
     << "      Show more informational output.\n"
     << "    -h,--help\n"
@@ -95,8 +99,9 @@ void VerifyOptions(const Options& opts) {
     throw std::runtime_error("ONNX model directory path must be provided.");
   }
 
-  // validate execution provider since it has a valid value
-  ValidateExecutionProvider(opts.execution_provider);
+  if (opts.ep_library_name.empty()) {
+    ValidateExecutionProvider(opts.execution_provider);
+  }
 }
 
 }  // namespace
@@ -140,6 +145,9 @@ Options ParseOptionsFromCommandLine(int argc, const char* const* argv) {
         opts.max_length = ParseNumber<int64_t>(next_arg(i));
       } else if (arg == "--reuse_generator") {
         opts.reuse_generator = true;
+      } else if (arg == "--ep_library") {
+        opts.ep_library_name = next_arg(i);
+        opts.ep_library_path = next_arg(i);
       } else if (arg == "-v" || arg == "--verbose") {
         opts.verbose = true;
       } else if (arg == "-h" || arg == "--help") {

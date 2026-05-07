@@ -286,6 +286,19 @@ struct Config {
       int num_hidden_layers{};
       int head_size{};
 
+      // [NO_CHUNK_EXPERIMENTAL] Legacy static-shape mode retained as an A/B
+      // reference against the sliding_window chunked path. When > 0 the
+      // Generator pads every multi-token prompt to fixed_prompt_length with
+      // pad_token_id in ONE session.Run (no chunking), and
+      // DefaultPositionInputs::RewindStaticMaskAfterPadding zeros the
+      // trailing mask cells afterwards. Mutually exclusive with
+      // sliding_window (config-load validation rejects configs setting
+      // both). Continuous decoding / chat mode is NOT supported on this
+      // path; use sliding_window with alignment="left" for those. This
+      // knob is expected to be removed in a future cleanup once the
+      // sliding_window path is considered the source of truth.
+      int fixed_prompt_length{};
+
       struct SlidingWindow {               // Sliding window parameters for models that process input prompt in chunks
         int window_size{};                 // The size of the window to slide over the input prompt
         int pad_value{};                   // The key-value cache padding value to use for the sliding window for inactive tokens
