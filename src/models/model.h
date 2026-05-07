@@ -62,6 +62,12 @@ struct State {
   std::string graph_id_{};
   std::shared_ptr<Adapters> adapters_;
   ExtraOutputs extra_outputs_;
+
+  // Lazily-created OrtIoBinding for the binding-routed Run path. The
+  // bindings are reset on every call to avoid stale tensor references;
+  // the speedup comes from the binding execution path itself rather than
+  // bind-once-reuse semantics.
+  std::unique_ptr<OrtIoBinding> io_binding_;
 };
 
 struct TokenizerStream : LeakChecked<TokenizerStream> {
