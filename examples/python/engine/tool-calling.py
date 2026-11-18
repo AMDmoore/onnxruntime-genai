@@ -96,6 +96,9 @@ def run(args):
     config.clear_providers()
     if args.execution_provider != "cpu":
         config.append_provider(args.execution_provider)
+    if args.execution_provider == "AMDGPU":
+        config.set_provider_option("AMDGPU", "profile", "hip")
+        config.set_provider_option("AMDGPU", "enable_graph_capture", "0")
 
     model = og.Model(config)
     tokenizer = og.Tokenizer(model)
@@ -165,7 +168,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen tool calling with the paged GenAI Engine")
     parser.add_argument("-m", "--model_path", required=True)
-    parser.add_argument("-e", "--execution_provider", required=True, choices=["cpu", "cuda", "dml", "webgpu"])
+    parser.add_argument("-e", "--execution_provider", required=True, choices=["cpu", "cuda", "dml", "webgpu", "AMDGPU"])
     parser.add_argument("--tools_file", required=True)
     parser.add_argument("--user_prompt", default="What is the weather in Redmond, WA?")
     parser.add_argument("--max_length", type=int, default=512)

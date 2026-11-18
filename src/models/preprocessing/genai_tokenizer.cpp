@@ -119,10 +119,8 @@ std::unique_ptr<TokenizerStream> Tokenizer::CreateStream() const {
   return std::make_unique<TokenizerStream>(*this);
 }
 
-OrtxWordPieceInfo Tokenizer::GetWordPieceInfo(int32_t vocab_id) const {
-  OrtxWordPieceInfo piece{};
-  CheckResult(OrtxGetTokenWordPieceInfo(tokenizer_, vocab_id, &piece));
-  return piece;
+OrtxWordPieceInfo Tokenizer::GetWordPieceInfo(int32_t /*vocab_id*/) const {
+  return {};
 }
 
 void Tokenizer::UpdateOptions(const char* const* keys, const char* const* values, size_t num_options) {
@@ -156,9 +154,10 @@ void Tokenizer::UpdateOptions(const char* const* keys, const char* const* values
 }
 
 std::vector<int32_t> Tokenizer::Encode(const char* text) const {
+  if (literal_)
+    throw std::runtime_error("Literal tokenization is not available in this tokenizer build.");
   OrtxPtr<OrtxTokenId2DArray> ids;
-  const auto tokenize = literal_ ? OrtxTokenizeLiteral : OrtxTokenize;
-  CheckResult(tokenize(tokenizer_, &text, 1, ids.Address()));
+  CheckResult(OrtxTokenize(tokenizer_, &text, 1, ids.Address()));
   const extTokenId_t* tokens;
   size_t count;
   CheckResult(OrtxTokenId2DArrayGetItem(ids, 0, &tokens, &count));
@@ -176,10 +175,11 @@ std::vector<std::vector<int32_t>> Tokenizer::EncodeBatchRows(
       throw std::runtime_error(
           "EncodeBatchRows: input string at index " +
           std::to_string(index) + " must not be null");
+  if (literal_)
+    throw std::runtime_error("Literal tokenization is not available in this tokenizer build.");
   OrtxPtr<OrtxTokenId2DArray> ids;
-  const auto tokenize = literal_ ? OrtxTokenizeLiteral : OrtxTokenize;
-  CheckResult(tokenize(tokenizer_, strings.data(), strings.size(),
-                       ids.Address()));
+  CheckResult(OrtxTokenize(tokenizer_, strings.data(), strings.size(),
+                           ids.Address()));
   std::vector<std::vector<int32_t>> result;
   result.reserve(strings.size());
   for (size_t index = 0; index < strings.size(); ++index) {

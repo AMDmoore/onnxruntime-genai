@@ -32,6 +32,8 @@ struct ScenarioConfig {
   std::string scenario{"decode_baseline"};
   int concurrency{1};
   std::optional<int> prompt_length_k;
+  // Plain-text prompt encoded as-is; when set it replaces the RULER bucket selected by prompt_length_k.
+  std::string prompt_file;
   std::string model_path;
   std::string execution_provider{"cuda"};
   std::string execution_provider_library;

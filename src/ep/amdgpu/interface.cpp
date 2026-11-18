@@ -304,6 +304,11 @@ struct InterfaceImpl : DeviceInterface {
 
   void Synchronize() override {}
 
+  // Every fixed-state operation on this device (zeroing, ranged copies, allocation) goes through
+  // ORT's CopyTensors with no stream, which completes before returning, and session runs finish
+  // before they return. There is no deferred device work for Synchronize to wait on.
+  bool SupportsTransactionalFixedState() const override { return true; }
+
  private:
   Ort::Allocator* ort_allocator_{};
   const OrtMemoryInfo* ort_memory_info_{};
@@ -345,9 +350,12 @@ struct PinnedInputsImpl : DeviceInterface {
   }
   void Synchronize() override { base_.Synchronize(); }
 
+  // Pinned allocations are host-accessible, so the cast runs on the CPU against the same
+  // addresses. The device interface has no cast of its own; delegating there returns false
+  // and the engine then samples uninitialized logits.
   bool Cast(void* input, void* output, ONNXTensorElementDataType input_type,
             ONNXTensorElementDataType output_type, size_t element_count) override {
-    return base_.Cast(input, output, input_type, output_type, element_count);
+    return GetDeviceInterface(DeviceType::CPU)->Cast(input, output, input_type, output_type, element_count);
   }
 
   // In-place CPU updates on the pinned buffer. Delegate to the CPU interface and report

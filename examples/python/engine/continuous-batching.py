@@ -134,6 +134,9 @@ class Engine:
         self.config.clear_providers()
         if execution_provider != "cpu":
             self.config.append_provider(execution_provider)
+        if execution_provider == "AMDGPU":
+            self.config.set_provider_option("AMDGPU", "profile", "hip")
+            self.config.set_provider_option("AMDGPU", "enable_graph_capture", "0")
         self.model = og.Model(self.config)
         self.tokenizer = og.Tokenizer(self.model)
         self.engine = og.Engine(self.model)
@@ -192,7 +195,7 @@ if __name__ == "__main__":
         "--execution_provider",
         type=str,
         required=True,
-        choices=["cpu", "cuda", "dml", "webgpu"],
+        choices=["cpu", "cuda", "dml", "webgpu", "AMDGPU"],
         help="Execution provider to run ONNX model with",
     )
     parser.add_argument(

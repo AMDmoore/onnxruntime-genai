@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -43,8 +45,8 @@ static const ScenarioBase::Registrar<DecodeBaselineScenario> kRegistrar("decode_
 void DecodeBaselineScenario::ValidateConfig(const ScenarioConfig& config) const {
   ScenarioBase::ValidateConfig(config);
 
-  if (!config.prompt_length_k) {
-    throw std::invalid_argument("decode_baseline requires prompt_length_k");
+  if (!config.prompt_length_k && config.prompt_file.empty()) {
+    throw std::invalid_argument("decode_baseline requires prompt_length_k or prompt_file");
   }
   if (!IsAllowedConcurrency(config.concurrency)) {
     throw std::invalid_argument("decode_baseline requires concurrency in [1,2,4,8]");
@@ -54,22 +56,37 @@ void DecodeBaselineScenario::ValidateConfig(const ScenarioConfig& config) const 
 ScenarioExecutionOutput DecodeBaselineScenario::Execute(const ScenarioConfig& config, const BenchmarkContext&) const {
   const std::string log_tag = Name();
   const std::string tag = "[" + log_tag + "] ";
-  const int prompt_length_k = config.prompt_length_k.value();
+  const bool use_prompt_file = !config.prompt_file.empty();
 
   std::cout << tag << "Execute start: model_path='" << config.model_path
             << "', provider='" << config.execution_provider
             << "', concurrency=" << config.concurrency
-            << ", measured_runs=" << config.measured_runs
-            << ", prompt_length_k=" << prompt_length_k
-            << ", generation_tokens=" << config.generation_tokens
-            << std::endl;
+            << ", measured_runs=" << config.measured_runs;
+  if (use_prompt_file) {
+    std::cout << ", prompt_file='" << config.prompt_file << "'";
+  } else {
+    std::cout << ", prompt_length_k=" << config.prompt_length_k.value();
+  }
+  std::cout << ", generation_tokens=" << config.generation_tokens << std::endl;
 
   MemorySampler memory;
   memory.Start();
   auto engineResources = CreateEngineResources(config);
 
-  std::mt19937 prompt_random(kRandomSeed);
-  auto prompt_tokens = BuildRulerPromptTokens(prompt_length_k, *engineResources.tokenizer, prompt_random);
+  std::unique_ptr<OgaSequences> prompt_tokens;
+  if (use_prompt_file) {
+    std::ifstream prompt_stream(config.prompt_file, std::ios::binary);
+    if (!prompt_stream) {
+      throw std::runtime_error("Unable to open prompt_file: " + config.prompt_file);
+    }
+    std::ostringstream prompt_text;
+    prompt_text << prompt_stream.rdbuf();
+    prompt_tokens = OgaSequences::Create();
+    engineResources.tokenizer->Encode(prompt_text.str().c_str(), *prompt_tokens);
+  } else {
+    std::mt19937 prompt_random(kRandomSeed);
+    prompt_tokens = BuildRulerPromptTokens(config.prompt_length_k.value(), *engineResources.tokenizer, prompt_random);
+  }
 
   const size_t prompt_token_count = prompt_tokens->SequenceCount(0);
   std::cout << tag << "Prompt token count: " << prompt_token_count << std::endl;

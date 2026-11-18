@@ -9,6 +9,16 @@
 
 namespace Generators {
 
+namespace {
+
+// Engine graph buffers record CUDA/WebGPU capture ids. AMDGPU reports capture as enabled by
+// default, but the hip backend does not consume gpu_graph_id, so those buffers must stay off.
+bool EngineDeviceCapturesGraphs(DeviceType type) {
+  return type == DeviceType::CUDA || type == DeviceType::NvTensorRtRtx || type == DeviceType::WEBGPU;
+}
+
+}  // namespace
+
 SimpleDecoder::SimpleDecoder(std::shared_ptr<DecoderOnly_Model> model,
                              std::shared_ptr<CacheManager> cache_manager)
     : model_{model}, cache_manager_{cache_manager} {
@@ -39,7 +49,8 @@ SimpleDecoder::SimpleDecoder(std::shared_ptr<DecoderOnly_Model> model,
     position_planes_ = PackedPositionIdPlanes(*model_);
   }
   if (IsGraphCaptureEnabled(model_->config_->model.decoder.session_options) &&
-      cache_manager_->SupportsDynamicBatching()) {
+      cache_manager_->SupportsDynamicBatching() && model_->p_device_ &&
+      EngineDeviceCapturesGraphs(model_->p_device_->GetType())) {
     // The scheduler clamps every request's draft width to what the cache can roll back, and a
     // verify step runs one token plus those drafts. A per-request speculative option can raise the
     // width above the config default, so the cache's ceiling is what the buffers have to cover.
@@ -215,7 +226,8 @@ void SimpleDecoder::Decode(ScheduledRequests& scheduled_requests,
   }
 
   if (IsGraphCaptureEnabled(model_->config_->model.decoder.session_options) &&
-      cache_manager_->SupportsDynamicBatching()) {
+      cache_manager_->SupportsDynamicBatching() && model_->p_device_ &&
+      EngineDeviceCapturesGraphs(model_->p_device_->GetType())) {
     context.run_options->AddConfigEntry("gpu_graph_id", std::to_string(annotation_id).c_str());
     // Every consumer of a captured step's outputs runs on the session's CUDA stream, and the first
     // host read of them (the sampled token ids) synchronizes that stream. Skipping the end-of-run

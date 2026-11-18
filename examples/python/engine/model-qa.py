@@ -31,6 +31,10 @@ def run(args: argparse.Namespace):
     config.clear_providers()
     if args.execution_provider != "cpu":
         config.append_provider(args.execution_provider)
+    if args.execution_provider == "AMDGPU":
+        # clear_providers drops the file's provider options. Pin the hip backend and stay eager.
+        config.set_provider_option("AMDGPU", "profile", "hip")
+        config.set_provider_option("AMDGPU", "enable_graph_capture", "0")
 
     model = og.Model(config)
     tokenizer = og.Tokenizer(model)
@@ -115,7 +119,7 @@ if __name__ == "__main__":
         "--execution_provider",
         type=str,
         required=True,
-        choices=["cpu", "cuda", "webgpu"],
+        choices=["cpu", "cuda", "webgpu", "AMDGPU"],
         help="Execution provider to run ONNX model with",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")

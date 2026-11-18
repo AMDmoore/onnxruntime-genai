@@ -12,6 +12,11 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include "ort_genai.h"
@@ -49,6 +54,7 @@ std::vector<ScenarioConfig> ParseScenarioConfigs(const nlohmann::json& root) {
       if (e.contains("prompt_length_k")) {
         config.prompt_length_k = e.at("prompt_length_k").get<int>();
       }
+      config.prompt_file = e.value("prompt_file", std::string{});
       config.model_path = e.value("model_path", std::string{});
       config.execution_provider = e.value("execution_provider", config.execution_provider);
       config.execution_provider_library = e.value("execution_provider_library", std::string{});
@@ -90,9 +96,10 @@ void RegisterExecutionProviderLibraries(const std::vector<ScenarioConfig>& confi
       continue;
     }
 
+    const std::string provider_library_utf8 = provider_library.string();
     std::cout << "[dispatcher] Registering " << registration_name << " execution provider library: "
-              << provider_library.string() << std::endl;
-    OgaRegisterExecutionProviderLibrary(registration_name, provider_library.c_str());
+              << provider_library_utf8 << std::endl;
+    OgaRegisterExecutionProviderLibrary(registration_name, provider_library_utf8.c_str());
   }
 }
 
@@ -154,6 +161,21 @@ int DispatchScenarios(const fs::path& executable, const fs::path& config_path, c
   return any_scenario_failed ? 1 : 0;
 }
 
+fs::path CurrentExecutable() {
+#if defined(_WIN32)
+  std::wstring buffer(MAX_PATH, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) {
+    throw std::runtime_error("Failed to resolve the engine_benchmark executable path.");
+  }
+  buffer.resize(length);
+  return fs::path(buffer);
+#else
+  // /proc/self/exe is a Linux virtual path that points to the currently running executable.
+  return fs::canonical("/proc/self/exe");
+#endif
+}
+
 }  // namespace engine_benchmark
 
 int main(int argc, char** argv) {
@@ -172,8 +194,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    // /proc/self/exe is a Linux virtual path that points to the currently running executable
-    return engine_benchmark::DispatchScenarios(fs::canonical("/proc/self/exe"), config_path, out_dir);
+    return engine_benchmark::DispatchScenarios(engine_benchmark::CurrentExecutable(), config_path, out_dir);
   } catch (const std::exception& ex) {
     std::cerr << "engine_benchmark failed: " << ex.what() << std::endl;
     return 1;

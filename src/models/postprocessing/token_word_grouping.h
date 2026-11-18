@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ortx_tokenizer.h"
+#include "models/preprocessing/word_piece_compat.h"
 
 #include <cstddef>
 #include <optional>

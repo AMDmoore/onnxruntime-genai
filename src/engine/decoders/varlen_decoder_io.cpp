@@ -1148,9 +1148,11 @@ std::vector<DeviceSpan<float>> VarlenDecoderIO::ProcessLogits() {
   }
 
   if (requires_cast && rows_are_contiguous) {
-    model_.p_device_inputs_->Cast(logits_bytes.Span().data(), logits_fp32_span.Span().data(),
-                                  active_logits_->GetType(), Ort::TypeToTensorType<float>,
-                                  valid_token_indices_.size() * static_cast<size_t>(vocab_size));
+    if (!model_.p_device_inputs_->Cast(logits_bytes.Span().data(), logits_fp32_span.Span().data(),
+                                       active_logits_->GetType(), Ort::TypeToTensorType<float>,
+                                       valid_token_indices_.size() * static_cast<size_t>(vocab_size))) {
+      throw std::runtime_error("The model device cannot cast logits to float.");
+    }
     for (size_t i = 0; i < valid_token_indices_.size(); ++i) {
       logits_vector.push_back(logits_fp32_span.subspan(i * vocab_size, vocab_size));
     }
@@ -1162,7 +1164,10 @@ std::vector<DeviceSpan<float>> VarlenDecoderIO::ProcessLogits() {
       auto logits_of_last_token_fp32 = logits_fp32_span.subspan(i * vocab_size, vocab_size);
       void* src_data = logits_bytes_vector[i].Span().data();
       void* dst_data = logits_of_last_token_fp32.Span().data();
-      model_.p_device_inputs_->Cast(src_data, dst_data, active_logits_->GetType(), Ort::TypeToTensorType<float>, vocab_size);
+      if (!model_.p_device_inputs_->Cast(src_data, dst_data, active_logits_->GetType(),
+                                         Ort::TypeToTensorType<float>, vocab_size)) {
+        throw std::runtime_error("The model device cannot cast logits to float.");
+      }
       logits_vector.push_back(logits_of_last_token_fp32);
     } else {
       auto logits_of_last_token_fp32 = model_.p_device_inputs_->WrapMemory<float>(

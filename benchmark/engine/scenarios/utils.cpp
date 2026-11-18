@@ -201,6 +201,12 @@ EngineResources::EngineResources(const ScenarioConfig& config) {
   oga_config = OgaConfig::Create(resolved_model_path.c_str());
   oga_config->ClearProviders();
   oga_config->AppendProvider(config.execution_provider.c_str());
+  if (config.execution_provider == "AMDGPU") {
+    // ClearProviders drops the provider options from genai_config.json. Pin the hip backend and
+    // keep graph capture off, as the Engine examples do.
+    oga_config->SetProviderOption("AMDGPU", "profile", "hip");
+    oga_config->SetProviderOption("AMDGPU", "enable_graph_capture", "0");
+  }
   model = OgaModel::Create(*oga_config);
   tokenizer = OgaTokenizer::Create(*model);
   engine = OgaEngine::Create(*model);

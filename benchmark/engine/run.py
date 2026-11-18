@@ -21,8 +21,8 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--cuda_visible_devices",
-        required=True,
-        help="Comma-separated GPU IDs; each scenario waits for and uses one available GPU.",
+        default="",
+        help="Comma-separated CUDA GPU IDs. Omit it when the scenario provider is not CUDA.",
     )
     parser.add_argument("--verbose", dest="verbose", action="store_true", help="Print each benchmark process's output.")
     args = parser.parse_args()
@@ -33,9 +33,10 @@ def main() -> int:
         raise ValueError("config must contain a non-empty JSON array of scenarios")
 
     gpu_ids = [gpu.strip() for gpu in args.cuda_visible_devices.split(",") if gpu.strip()]
+    # An empty list runs each scenario on the process-default device and does not set
+    # CUDA_VISIBLE_DEVICES. One queue token per GPU otherwise.
     if not gpu_ids:
-        raise ValueError("--cuda_visible_devices must contain at least one GPU ID")
-    # One queue token per GPU; taking a token reserves that GPU for one scenario.
+        gpu_ids = [""]
     available_gpus = Queue()
     for gpu_id in gpu_ids:
         available_gpus.put(gpu_id)
@@ -54,10 +55,12 @@ def main() -> int:
             environment = os.environ.copy()
             # Block until a GPU is free, then return it after the subprocess exits.
             gpu_id = available_gpus.get()
-            environment["CUDA_VISIBLE_DEVICES"] = gpu_id
+            if gpu_id:
+                environment["CUDA_VISIBLE_DEVICES"] = gpu_id
             label = f"{index}/{len(scenarios)} {scenario['scenario']}"
             try:
-                print(f"Starting {label} on GPU {gpu_id}", flush=True)
+                where = f" on GPU {gpu_id}" if gpu_id else ""
+                print(f"Starting {label}{where}", flush=True)
                 completed = subprocess.run(
                     [str(args.executable), "--config", str(temp_config), "--out", str(scenario_out)],
                     check=False,

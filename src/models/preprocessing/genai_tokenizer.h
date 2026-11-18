@@ -5,7 +5,7 @@
 
 #include "generator/generators.h"
 #include "models/utils.h"
-#include "ortx_tokenizer.h"
+#include "models/preprocessing/word_piece_compat.h"
 #include "span.h"
 
 #include <memory>
